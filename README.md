@@ -15,7 +15,20 @@
   <img src="https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white" alt="Swift 6.0">
 </p>
 
-# CCSwitcher
+# CCSwitcher Personal
+
+Personal fork of [XueshiQiao/CCSwitcher](https://github.com/XueshiQiao/CCSwitcher), based on 1.12.0.
+
+- Active usage keeps its own refresh interval and speeds up near the switching threshold.
+- Inactive accounts refresh hourly by default, one at a time; startup and the manual refresh button sample all accounts.
+- Auto-switch can prefer the soonest **weekly reset**, with a 99% threshold during the final 48 hours.
+- Local cost/activity statistics run **once a day** or on request, independently of usage checks and switching.
+- Upstream automatic updates are disabled in the personal build.
+
+Run `swift test` for the credential-free policy tests and `scripts/build-personal.sh` for a locally signed app and ZIP.
+See [the personal fork guide](docs/PERSONAL_FORK.md) for behavior, installation and validation details.
+
+## Upstream project
 
 CCSwitcher is a lightweight, pure menu bar macOS application designed to help developers manage and switch between multiple Claude Code accounts **without interrupting your multi-account workflow**. The native `claude auth login` flow is destructive — every switch wipes the previous account's credentials and forces another full browser OAuth. CCSwitcher keeps a per-account backup of every credential, atomically swaps the keychain entry and `~/.claude.json` on switch, and all accounts stay available for one-click swap-back. CCSwitcher also monitors API usage, gracefully handles background token refreshes, and circumvents common macOS menu bar app limitations.
 

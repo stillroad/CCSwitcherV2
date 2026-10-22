@@ -48,7 +48,9 @@ struct CCSwitcherApp: App {
                     )
                     // Kick off background usage tracking immediately upon app start
                     Task {
-                        await appState.refresh()
+                        // Seed reset ordering once at launch. Later timer cycles
+                        // only poll the active account and one due inactive account.
+                        await appState.refresh(allAccounts: true)
                         appState.startAutoRefresh(interval: refreshInterval)
                     }
                 }

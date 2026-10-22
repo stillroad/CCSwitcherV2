@@ -134,6 +134,7 @@ struct MenuBarModuleView: View {
     }
 
     private var dailyCostText: String {
+        guard appState.hasCurrentLocalStats else { return "—" }
         let cost = appState.costSummary.todayCost
         guard cost > 0 else { return "—" }
         return String(format: "$%.2f", cost)

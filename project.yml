@@ -38,7 +38,9 @@ targets:
       path: CCSwitcher/Info.plist
       properties:
         LSUIElement: true
-        CFBundleDisplayName: $(PRODUCT_NAME)
+        CFBundleDisplayName: CCSwitcher Personal
+        CCSwitcherPersonalBuild: true
+        SUEnableAutomaticChecks: false
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleURLTypes:
@@ -106,3 +108,27 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.application-groups:
           - 584KQTRF3B.me.xueshi.ccswitcher
+
+  # Isolated native UI preview: no account loading, timers, network or keychain.
+  CCSwitcherPreview:
+    type: application
+    platform: macOS
+    sources:
+      - path: CCSwitcher
+        excludes:
+          - CCSwitcherApp.swift
+      - path: Shared
+      - path: Tools/PreviewSettings.swift
+    info:
+      path: build/Preview-Info.plist
+      properties:
+        LSUIElement: true
+        CCSwitcherPersonalBuild: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.ccswitcher.settings-preview
+        PRODUCT_NAME: CCSwitcherPreview
+        SKIP_INSTALL: true
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    dependencies:
+      - package: Sparkle

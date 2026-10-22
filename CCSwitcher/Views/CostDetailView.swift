@@ -7,9 +7,12 @@ struct CostDetailView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                todayCard
-                periodSummaryCards
-                dailyHistorySection
+                LocalStatsStatusView().sectionPadding()
+                if appState.hasCurrentLocalStats { todayCard }
+                if appState.lastLocalStatsRefresh != nil {
+                    periodSummaryCards
+                    dailyHistorySection
+                }
                 pricingInfoSection
             }
             .padding(.vertical, 12)

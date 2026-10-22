@@ -15,9 +15,17 @@ final class UpdateChecker: ObservableObject {
     /// Source-compat shim. Sparkle's UI is responsible for visible progress.
     @Published var isChecking = false
 
-    private let controller: SPUStandardUpdaterController
+    let isPersonalBuild = Bundle.main.object(forInfoDictionaryKey: "CCSwitcherPersonalBuild") as? Bool ?? false
+    private let controller: SPUStandardUpdaterController?
 
     init() {
+        // Preserve this fork's behavior even when upstream publishes a release.
+        // Never construct/start Sparkle for a personal build (saved upstream
+        // preferences may already have automatic updates enabled).
+        guard !isPersonalBuild else {
+            controller = nil
+            return
+        }
         // `startingUpdater: true` enables Sparkle's automatic background
         // checks at the interval configured by Sparkle (default: 1 day).
         // No delegates needed: standard UI behavior is what we want.
@@ -33,9 +41,9 @@ final class UpdateChecker: ObservableObject {
     /// Background = silent unless an update is found.
     func checkForUpdates(manual: Bool = false) {
         if manual {
-            controller.checkForUpdates(nil)
+            controller?.checkForUpdates(nil)
         } else {
-            controller.updater.checkForUpdatesInBackground()
+            controller?.updater.checkForUpdatesInBackground()
         }
     }
 }

@@ -52,10 +52,13 @@ struct UsageDashboardView: View {
                     .padding(.vertical, 40)
                 } else {
                     // Today's cost banner (local parsing, no API needed)
-                    todayCostBanner
+                    LocalStatsStatusView().sectionPadding()
+                    if appState.hasCurrentLocalStats {
+                        todayCostBanner
 
                     // Today's activity stats
-                    todayActivityCard
+                        todayActivityCard
+                    }
 
                     ForEach(appState.accounts) { account in
                         accountUsageCard(account: account, usage: appState.accountUsage[account.id])

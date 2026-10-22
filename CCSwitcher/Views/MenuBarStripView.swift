@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 private struct StripWidthKey: PreferenceKey {
     static var defaultValue: CGFloat { 0 }
@@ -27,11 +28,9 @@ struct MenuBarStripView: View {
 
     @State private var tick = Date()
     @State private var iconFilled = false
-    // Polled refresh. ObservableObject change delivery is unreliable for a
-    // SwiftUI view hosted in an NSStatusItem, so we re-read AppState/config on
-    // a short interval (the pattern menu-bar monitors like iStats/Stats use).
-    // This also keeps the reset countdowns current.
-    private let tickTimer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    // StatusItemController already pushes account/config changes immediately.
+    // Only the displayed minute countdowns need a timer.
+    private let tickTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 8) {

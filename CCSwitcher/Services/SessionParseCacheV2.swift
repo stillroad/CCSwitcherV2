@@ -69,7 +69,7 @@ struct ActivityDayContributionV2: Codable, Sendable {
 
 /// What pricing snapshot is currently driving cost output. Stamped on
 /// the envelope so it's debuggable from outside the app.
-struct PricingMeta: Codable, Sendable {
+struct PricingMeta: Codable, Sendable, Equatable {
     let source: String          // "bundle:abc1234" or "fresh:2026-05-15T03:00Z"
     let fetchedAt: Date?
 }
@@ -96,6 +96,7 @@ actor SessionParseCacheV2 {
     private var files: [String: CachedFileV2] = [:]
     private var pricingMeta: PricingMeta = .init(source: "unknown", fetchedAt: nil)
     private var loaded = false
+    private var needsSave = false
 
     private init() {
         self.claudeProjectsDir = NSHomeDirectory() + "/.claude/projects"
@@ -123,7 +124,9 @@ actor SessionParseCacheV2 {
         await PricingService.shared.reloadIfFreshChanged()
         // Capture the current pricing source for the envelope stamp.
         let src = await PricingService.shared.currentSource()
-        pricingMeta = stampFor(source: src)
+        let newPricingMeta = stampFor(source: src)
+        needsSave = needsSave || pricingMeta != newPricingMeta
+        pricingMeta = newPricingMeta
         // Trigger a TTL'd background refresh of the LiteLLM JSON. No-op if fresh.
         PricingService.shared.refreshInBackground()
 
@@ -150,7 +153,8 @@ actor SessionParseCacheV2 {
             + "pricing=\(pricingMeta.source)"
         )
 
-        save()
+        needsSave = needsSave || !result.updates.isEmpty || evicted > 0
+        if needsSave { save() }
     }
 
     /// Per-day, per-model cost summary. Applies global max-output-wins dedup
@@ -404,6 +408,7 @@ actor SessionParseCacheV2 {
         }
         do {
             try data.write(to: cacheURL, options: .atomic)
+            needsSave = false
             log.info("SAVE bytes=\(data.count) entries=\(files.count)")
         } catch {
             log.error("SAVE failed: \(error.localizedDescription)")

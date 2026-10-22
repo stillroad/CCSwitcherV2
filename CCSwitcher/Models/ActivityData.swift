@@ -1,7 +1,7 @@
 import Foundation
 
 /// Today's coding activity stats parsed from Claude Code session JSONL files.
-struct ActivityStats: Sendable {
+struct ActivityStats: Sendable, Codable {
     var conversationTurns: Int = 0
     var activeCodingMinutes: Int = 0
     var toolUsage: [String: Int] = [:]

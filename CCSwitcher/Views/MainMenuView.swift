@@ -347,14 +347,14 @@ struct MainMenuView: View {
             Spacer()
 
             Button {
-                Task { await appState.refresh() }
+                Task { await appState.refresh(allAccounts: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.caption)
             }
             .buttonStyle(.plain)
             .focusable(false)
-            .help("Refresh")
+            .help("Refresh all account usage")
 
             Button {
                 NSApp.activate(ignoringOtherApps: true)

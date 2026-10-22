@@ -12,6 +12,10 @@ struct SettingsView: View {
     @AppStorage("appLanguage") private var appLanguage = "auto"
     @AppStorage("autoSwitchEnabled") private var autoSwitchEnabled = false
     @AppStorage("autoSwitchThreshold") private var autoSwitchThreshold = 90.0
+    @AppStorage("inactiveRefreshInterval") private var inactiveRefreshInterval = RefreshPolicy.defaultInactiveInterval
+    @AppStorage("localStatsInterval") private var localStatsInterval = 86_400.0
+    @AppStorage("autoSwitchStrategy") private var autoSwitchStrategy = AutoSwitchEngine.Strategy.soonestReset.rawValue
+    @AppStorage("useNearResetThreshold") private var useNearResetThreshold = true
     @State private var launchAtLogin = false
 
     var body: some View {
@@ -36,7 +40,7 @@ struct SettingsView: View {
                     Label("About", systemImage: "info.circle")
                 }
         }
-        .frame(width: 520, height: 440)
+        .frame(width: 560, height: 620)
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
@@ -47,7 +51,7 @@ struct SettingsView: View {
     private var generalTab: some View {
         Form {
             Section("Refresh") {
-                Picker("Auto-refresh interval", selection: $refreshInterval) {
+                Picker("Active account usage", selection: $refreshInterval) {
                     Text("15 seconds").tag(15.0)
                     Text("30 seconds").tag(30.0)
                     Text("1 minute").tag(60.0)
@@ -57,11 +61,28 @@ struct SettingsView: View {
                 .onChange(of: refreshInterval) { _, newValue in
                     appState.startAutoRefresh(interval: newValue)
                 }
+                Picker("Inactive account usage", selection: $inactiveRefreshInterval) {
+                    Text("30 minutes").tag(1800.0)
+                    Text("1 hour").tag(3600.0)
+                    Text("3 hours").tag(10_800.0)
+                    Text("6 hours").tag(21_600.0)
+                }
+                Text("Inactive accounts refresh one at a time when due. A fresh usage check is required before an automatic switch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Refresh all account usage now") {
+                    Task { await appState.refresh(allAccounts: true) }
+                }
+                .disabled(appState.isLoading || appState.isLoggingIn)
             }
 
             Section("Auto-switch") {
                 Toggle("Switch account before hitting the limit", isOn: $autoSwitchEnabled)
                 if autoSwitchEnabled {
+                    Picker("Choose next account by", selection: $autoSwitchStrategy) {
+                        Text("Soonest weekly reset").tag(AutoSwitchEngine.Strategy.soonestReset.rawValue)
+                        Text("Most remaining quota").tag(AutoSwitchEngine.Strategy.mostRemaining.rawValue)
+                    }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Switch at")
@@ -72,10 +93,27 @@ struct SettingsView: View {
                         }
                         Slider(value: $autoSwitchThreshold, in: 50...99, step: 1)
                     }
-                    Text("When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping.")
+                    Toggle("Use up to 99% in the last 48 hours before weekly reset", isOn: $useNearResetThreshold)
+                    Text("The threshold applies to both 5-hour and weekly usage. Eligible accounts with the earliest weekly reset go first in reset mode. Unknown reset times go last.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Active checks speed up to 1 minute near the threshold, then 15 seconds in the final 2%. A 5-minute cooldown prevents repeated switches, unless fresh usage is already at 99%. Bursts can still use the remaining quota between checks.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+
+            Section("Local cost and activity") {
+                Picker("Calculate statistics", selection: $localStatsInterval) {
+                    Text("Only when requested").tag(0.0)
+                    Text("Once a day").tag(86_400.0)
+                    Text("Every hour").tag(3600.0)
+                    Text("Every 30 minutes").tag(1800.0)
+                }
+                Text("Reads local session logs. This schedule is independent of account usage checks and never delays switching.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LocalStatsStatusView()
             }
 
             Section("Account display") {
@@ -170,11 +208,17 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.tertiary)
 
-            Button(updateChecker.isChecking ? "Checking..." : "Check for Updates") {
-                updateChecker.checkForUpdates(manual: true)
+            if updateChecker.isPersonalBuild {
+                Text("Personal build · upstream updates disabled")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Button(updateChecker.isChecking ? "Checking..." : "Check for Updates") {
+                    updateChecker.checkForUpdates(manual: true)
+                }
+                .disabled(updateChecker.isChecking)
+                .padding(.top, 4)
             }
-            .disabled(updateChecker.isChecking)
-            .padding(.top, 4)
 
             Spacer()
 

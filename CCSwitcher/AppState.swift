@@ -7,6 +7,7 @@ private let log = FileLog("AppState")
 /// Central app state managing accounts, usage data, and active sessions.
 @MainActor
 final class AppState: ObservableObject {
+    private let isPreview: Bool
     // MARK: - Published State
 
     @Published var accounts: [Account] = []
@@ -28,6 +29,13 @@ final class AppState: ObservableObject {
     @Published var lastUsageRefresh: Date?
     @Published var costSummary: CostSummary = .empty
     @Published var activityStats: ActivityStats = .empty
+    @Published var isRefreshingLocalStats = false
+    @Published var lastLocalStatsRefresh: Date?
+    private var localStatsTask: Task<Void, Never>?
+
+    var hasCurrentLocalStats: Bool {
+        lastLocalStatsRefresh.map { Calendar.current.isDateInToday($0) } ?? false
+    }
 
     // Store errors as special struct to surface in UI
     struct UsageErrorState {
@@ -40,11 +48,11 @@ final class AppState: ObservableObject {
 
     // MARK: - Services
 
-    private let claudeService = ClaudeService.shared
+    private lazy var claudeService = ClaudeService.shared
     private let statsParser = StatsParser.shared
     private let costParser = CostParser.shared
     private let activityParser = ActivityParser.shared
-    private let keychain = KeychainService.shared
+    private lazy var keychain = KeychainService.shared
 
     private let accountsKey = "com.ccswitcher.accounts"
     private var refreshTimer: Timer?
@@ -55,11 +63,25 @@ final class AppState: ObservableObject {
     /// would each burst per-account usage requests and trip the endpoint's rate limit.
     private var isRefreshing = false
 
-    /// Round-robin cursor over non-active accounts: each refresh cycle fetches usage
-    /// for the active account plus ONE other, instead of all of them. The usage
-    /// endpoint's rate limit is tight and shared with every running Claude Code
-    /// session's own polling, so fewer requests per cycle beats a full sweep.
-    private var usageFetchCursor = 0
+    /// Attempts (including failures) drive scheduling; successful samples drive
+    /// display freshness. Keeping them separate avoids retrying a broken account
+    /// on every cycle and starving the remaining inactive accounts.
+    private var usageLastAttempt: [UUID: Date] = [:]
+    private var lastDiagnosticsAt: Date?
+
+    private var inactiveRefreshInterval: TimeInterval {
+        UserDefaults.standard.object(forKey: "inactiveRefreshInterval") as? Double
+            ?? RefreshPolicy.defaultInactiveInterval
+    }
+
+    private var autoSwitchPolicy: AutoSwitchEngine.Policy {
+        AutoSwitchEngine.Policy(
+            strategy: AutoSwitchEngine.Strategy(rawValue: UserDefaults.standard.string(forKey: "autoSwitchStrategy") ?? "") ?? .soonestReset,
+            normalThreshold: autoSwitchThreshold,
+            useNearResetThreshold: UserDefaults.standard.object(forKey: "useNearResetThreshold") as? Bool ?? true,
+            hysteresis: autoSwitchHysteresis
+        )
+    }
 
     /// Per-account "leave it alone until" timestamps. The usage endpoint enforces a
     /// long-window per-account quota - observed Retry-After values run into tens of
@@ -101,12 +123,21 @@ final class AppState: ObservableObject {
 
     private var lastAutoSwitchAt: Date?
     private var isEvaluatingAutoSwitch = false
+    private var failedAutoSwitchVerifications: [UUID: Date] = [:]
 
     // MARK: - Initialization
 
-    init() {
+    init(restoringSavedState: Bool = true) {
+        isPreview = !restoringSavedState
+        // The UI preview uses an empty state and must never open credentials.
+        guard restoringSavedState else { return }
         log.info("[init] Loading accounts from UserDefaults...")
         loadAccounts()
+        if let snapshot = LocalStatsSnapshot.load() {
+            costSummary = snapshot.cost
+            activityStats = snapshot.activity
+            lastLocalStatsRefresh = snapshot.updatedAt
+        }
         log.info("[init] Loaded \(self.accounts.count) accounts, active: \(self.activeAccount?.id.uuidString ?? "none")")
     }
 
@@ -123,14 +154,21 @@ final class AppState: ObservableObject {
     /// already running), auto-switch must not be evaluated either: it would act
     /// on state mid-mutation — swapping credentials during a login, or deciding
     /// on samples a concurrent refresh is rewriting.
-    func refresh() async {
-        guard await refreshData() else { return }
+    func refresh(allAccounts: Bool = false) async {
+        guard !isPreview else { return }
+        guard await refreshData(allAccounts: allAccounts) else { return }
         await evaluateAutoSwitch()
+        // Never await a JSONL scan on the quota/switching path. On a large
+        // history this can take minutes, during which usage must keep polling.
+        let interval = UserDefaults.standard.object(forKey: "localStatsInterval") as? Double ?? 86_400
+        if RefreshPolicy.localStatsDue(lastRefresh: lastLocalStatsRefresh, interval: interval, asOf: Date()) {
+            refreshLocalStats()
+        }
     }
 
     /// Returns true only when a full refresh actually ran.
-    private func refreshData() async -> Bool {
-        guard !isLoggingIn else {
+    private func refreshData(allAccounts: Bool) async -> Bool {
+        guard !isLoggingIn, !isSwitching else {
             log.info("[refresh] Skipping: login in progress")
             return false
         }
@@ -142,6 +180,7 @@ final class AppState: ObservableObject {
         defer { isRefreshing = false }
         lastCycleStart = Date()
         isLoading = true
+        defer { isLoading = false }
         errorMessage = nil
 
         claudeAvailable = await claudeService.isClaudeAvailable()
@@ -157,41 +196,66 @@ final class AppState: ObservableObject {
             }
         }
 
-        // Passive token health check (no CLI calls, keychain reads only)
-        diagnoseTokenHealth()
+        if RefreshPolicy.isDue(lastAttempt: lastDiagnosticsAt, interval: 3600, asOf: Date()) {
+            diagnoseTokenHealth()
+            lastDiagnosticsAt = Date()
+        }
 
-        // Fetch usage limits for all accounts
-        await fetchAllAccountUsage()
+        // Fetch active usage and any inactive accounts due this cycle.
+        await fetchAllAccountUsage(refreshAll: allAccounts)
         lastUsageRefresh = Date()
 
-        usageSummary = statsParser.getUsageSummary()
-        recentActivity = statsParser.getRecentActivity(days: 7)
-        activeSessions = statsParser.getActiveSessions()
-
-        // JSONL parsing: walk filesystem once via the shared cache, then
-        // pull aggregated outputs. The actor's executor is off the main
-        // thread, so awaiting these does not block the UI.
-        await SessionParseCacheV2.shared.refreshFromFilesystem()
-        let cost = await costParser.getCostSummary()
-        let activity = await activityParser.getTodayStats()
-        costSummary = cost
-        activityStats = activity
-
-        log.info("[refresh] Usage: weekly=\(self.usageSummary.weeklyMessages) msgs, \(self.activeSessions.count) active sessions, today=$\(String(format: "%.2f", cost.todayCost)) turns=\(activity.conversationTurns)")
-
         updateWidgetData()
-        isLoading = false
         return true
     }
 
+    /// Explicitly requested, or scheduled on its own much slower cadence.
+    /// The single task prevents overlapping scans while account polling carries on.
+    func refreshLocalStats() {
+        guard !isPreview, localStatsTask == nil else { return }
+        isRefreshingLocalStats = true
+        localStatsTask = Task(priority: .background) { [weak self] in
+            guard let self else { return }
+            defer {
+                self.isRefreshingLocalStats = false
+                self.localStatsTask = nil
+            }
+            await SessionParseCacheV2.shared.refreshFromFilesystem()
+            self.costSummary = await self.costParser.getCostSummary()
+            self.activityStats = await self.activityParser.getTodayStats()
+            self.usageSummary = self.statsParser.getUsageSummary()
+            self.recentActivity = self.statsParser.getRecentActivity(days: 7)
+            self.activeSessions = self.statsParser.getActiveSessions()
+            let updatedAt = Date()
+            self.lastLocalStatsRefresh = updatedAt
+            LocalStatsSnapshot(updatedAt: updatedAt, cost: self.costSummary,
+                               activity: self.activityStats).save()
+            self.updateWidgetData()
+        }
+    }
+
     func startAutoRefresh(interval: TimeInterval = 300) {
+        guard !isPreview else { return }
         stopAutoRefresh()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        // A cheap scheduling tick, not a network request every 15 seconds.
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                let now = Date()
+                let id = self.activeAccount?.id
+                var cadence = RefreshPolicy.activeInterval(
+                    configured: interval, usage: id.flatMap { self.accountUsage[$0] },
+                    autoSwitchEnabled: self.autoSwitchEnabled, policy: self.autoSwitchPolicy, asOf: now
+                )
+                if let id, let retry = self.usageRetryNotBefore[id], retry > now {
+                    cadence = max(cadence, min(interval, retry.timeIntervalSince(self.lastCycleStart)))
+                }
+                guard !self.isEvaluatingAutoSwitch, !self.isSwitching,
+                      RefreshPolicy.isDue(lastAttempt: self.lastCycleStart, interval: cadence, asOf: now) else { return }
                 await self.refresh()
             }
         }
+        refreshTimer?.tolerance = 1
     }
 
     func stopAutoRefresh() {
@@ -202,6 +266,8 @@ final class AppState: ObservableObject {
     // MARK: - Account Management
 
     func addAccount() async {
+        guard !isPreview else { return }
+        guard !isRefreshing, !isSwitching, !isLoggingIn else { return }
         log.info("[addAccount] Starting add current account flow...")
         guard claudeAvailable else {
             errorMessage = String(localized: "Claude CLI not found", bundle: L10n.bundle)
@@ -264,6 +330,7 @@ final class AppState: ObservableObject {
     }
 
     func loginNewAccount() async {
+        guard !isPreview else { return }
         log.info("[loginNewAccount] ===== Starting login new account flow =====")
         guard claudeAvailable else {
             errorMessage = String(localized: "Claude CLI not found", bundle: L10n.bundle)
@@ -274,7 +341,7 @@ final class AppState: ObservableObject {
         // entering while a switch is suspended mid-swap would back up the
         // WRONG live credential under the old active account's id — quietly
         // destroying that account's usable backup. Also blocks double-clicks.
-        guard !isSwitching, !isLoggingIn else {
+        guard !isRefreshing, !isSwitching, !isLoggingIn else {
             log.warning("[loginNewAccount] Skipped: a switch or another login is in progress")
             return
         }
@@ -397,6 +464,8 @@ final class AppState: ObservableObject {
     }
 
     func removeAccount(_ account: Account) {
+        guard !isPreview else { return }
+        guard !isRefreshing, !isSwitching, !isLoggingIn else { return }
         log.info("[removeAccount] Removing account \(account.id)")
         keychain.removeAccountBackup(forAccountId: account.id.uuidString)
         accounts.removeAll { $0.id == account.id }
@@ -406,6 +475,8 @@ final class AppState: ObservableObject {
         accountUsageSampledAt[account.id] = nil
         accountUsageErrors[account.id] = nil
         usageRetryNotBefore[account.id] = nil
+        usageLastAttempt[account.id] = nil
+        failedAutoSwitchVerifications[account.id] = nil
         if account.isActive, let first = accounts.first {
             accounts[accounts.startIndex].isActive = true
             activeAccount = accounts.first
@@ -417,6 +488,7 @@ final class AppState: ObservableObject {
     }
 
     func switchTo(_ account: Account) async {
+        guard !isPreview else { return }
         guard let currentActive = activeAccount, currentActive.id != account.id else {
             log.info("[switchTo] No switch needed (same account or no active account)")
             return
@@ -427,12 +499,11 @@ final class AppState: ObservableObject {
         // One credential mutation at a time: a switch already in flight (its
         // awaits leave the main actor free) or a running login must finish
         // before another switch may touch the keychain and ~/.claude.json.
-        guard !isSwitching, !isLoggingIn else {
+        guard !isRefreshing, !isSwitching, !isLoggingIn else {
             log.warning("[switchTo] Skipped: another switch or a login is in progress")
             return
         }
         isSwitching = true
-        defer { isSwitching = false }
 
         // Pre-switch: resolve the target's backup ONCE and hand it down.
         // "The store is briefly unreadable" and "no backup exists" are
@@ -447,10 +518,12 @@ final class AppState: ObservableObject {
         case .missing:
             log.error("[switchTo] ABORT: no backup for target account")
             errorMessage = String(localized: "No stored credentials for \(account.email). Use re-authenticate to fix.", bundle: L10n.bundle)
+            isSwitching = false
             return
         case .storeUnavailable:
             log.error("[switchTo] ABORT: backup store unreadable right now")
             errorMessage = String(localized: "Credential storage is temporarily unavailable. Try again shortly.", bundle: L10n.bundle)
+            isSwitching = false
             return
         }
 
@@ -460,8 +533,9 @@ final class AppState: ObservableObject {
         lastAutoSwitchAt = Date()
 
         isLoading = true
+        let outcome: ClaudeService.SwitchOutcome
         do {
-            let outcome = try await claudeService.switchAccount(from: currentActive, to: account, targetBackup: targetBackup)
+            outcome = try await claudeService.switchAccount(from: currentActive, to: account, targetBackup: targetBackup)
 
             for i in accounts.indices {
                 accounts[i].isActive = (accounts[i].id == account.id)
@@ -471,18 +545,21 @@ final class AppState: ObservableObject {
             }
             activeAccount = account
             saveAccounts()
-
-            await refresh()
-            // `refresh()` clears errorMessage, so surface the warning afterwards.
-            if let shadowedBy = outcome.shadowedBy {
-                errorMessage = String(localized: "Switched to \(account.email), but the Claude CLI is authenticating via \(shadowedBy) instead of the stored login, so it will not use this account.", bundle: L10n.bundle)
-            }
-            log.info("[switchTo] ===== Switch completed =====")
         } catch {
             errorMessage = error.localizedDescription
             isLoading = false
+            isSwitching = false
             log.error("[switchTo] Switch failed: \(error.localizedDescription)")
+            return
         }
+        isSwitching = false
+        isLoading = false
+        await refresh()
+        // `refresh()` clears errorMessage, so surface the warning afterwards.
+        if let shadowedBy = outcome.shadowedBy {
+            errorMessage = String(localized: "Switched to \(account.email), but the Claude CLI is authenticating via \(shadowedBy) instead of the stored login, so it will not use this account.", bundle: L10n.bundle)
+        }
+        log.info("[switchTo] ===== Switch completed =====")
     }
 
     // MARK: - Auto-switch
@@ -497,7 +574,7 @@ final class AppState: ObservableObject {
     }
 
     /// Evaluate whether the active account has reached the threshold and, if so,
-    /// switch to the same-provider account with the most quota left.
+    /// switch to an eligible same-provider account using the selected policy.
     /// Called after every completed refresh. Safe to call repeatedly.
     ///
     /// Candidates are ranked from whatever samples we hold, then the chosen one
@@ -511,14 +588,21 @@ final class AppState: ObservableObject {
         guard autoSwitchEnabled, !isEvaluatingAutoSwitch else { return }
         guard !isLoggingIn, !isSwitching, let active = activeAccount else { return }
 
-        // Cooldown: never auto-switch more than once per window.
-        if let last = lastAutoSwitchAt, Date().timeIntervalSince(last) < autoSwitchCooldown {
+        let activeSampledThisCycle = (accountUsageSampledAt[active.id] ?? .distantPast) >= lastCycleStart
+        if AutoSwitchEngine.isCoolingDown(lastSwitch: lastAutoSwitchAt, cooldown: autoSwitchCooldown,
+                                          activeUsage: accountUsage[active.id], activeSampleIsFresh: activeSampledThisCycle,
+                                          asOf: Date()) {
             return
         }
 
         // Only consider same-provider accounts (a Claude switch never touches Codex/Gemini).
-        let candidates = accounts.filter { $0.provider == active.provider && $0.id != active.id }
-        let activeSampledThisCycle = (accountUsageSampledAt[active.id] ?? .distantPast) >= lastCycleStart
+        let now = Date()
+        let candidates = accounts.filter {
+            $0.provider == active.provider && $0.id != active.id
+                && (usageRetryNotBefore[$0.id] ?? .distantPast) <= now
+                && (failedAutoSwitchVerifications[$0.id] ?? .distantPast).addingTimeInterval(60) <= now
+        }
+        let policy = autoSwitchPolicy
         let ranked = AutoSwitchEngine.rankedTargets(
             active: active,
             candidates: candidates,
@@ -526,7 +610,9 @@ final class AppState: ObservableObject {
             isSwitchable: { [unowned self] in self.isSwitchable($0) },
             activeSampledThisCycle: activeSampledThisCycle,
             threshold: autoSwitchThreshold,
-            hysteresisPct: autoSwitchHysteresis
+            hysteresisPct: autoSwitchHysteresis,
+            strategy: policy.strategy,
+            useNearResetThreshold: policy.useNearResetThreshold
         )
         guard !ranked.isEmpty else { return }
 
@@ -534,8 +620,7 @@ final class AppState: ObservableObject {
         defer { isEvaluatingAutoSwitch = false }
 
         let activeUtil = AutoSwitchEngine.bindingUtilization(accountUsage[active.id]) ?? -1
-        let ceiling = autoSwitchThreshold - autoSwitchHysteresis
-        log.info("[autoSwitch] Active \(active.id) at \(String(format: "%.0f", activeUtil))% (threshold \(String(format: "%.0f", self.autoSwitchThreshold))%); \(ranked.count) candidate(s)")
+        log.info("[autoSwitch] Active \(active.id) at \(String(format: "%.0f", activeUtil))% (threshold \(policy.threshold(for: accountUsage[active.id], asOf: Date()))%, strategy \(policy.strategy.rawValue)); \(ranked.count) candidate(s)")
 
         // At most ONE fresh verification request per evaluation. Later ranked
         // candidates only qualify via samples this cycle already took.
@@ -558,7 +643,8 @@ final class AppState: ObservableObject {
             }
 
             guard let verifiedUtil = AutoSwitchEngine.bindingUtilization(usage),
-                  verifiedUtil <= ceiling else {
+                  verifiedUtil <= policy.candidateCeiling(for: usage, asOf: Date()) else {
+                failedAutoSwitchVerifications[target.id] = Date()
                 log.info("[autoSwitch] Candidate \(target.id) failed verification (\(AutoSwitchEngine.bindingUtilization(usage).map { String(format: "%.0f%%", $0) } ?? "no reading")); trying next")
                 continue
             }
@@ -567,10 +653,17 @@ final class AppState: ObservableObject {
             // login starting, a timer-tick refresh beginning, or a manual switch
             // the user just clicked (which updates `activeAccount` only after
             // its subprocess work finishes — hence the explicit isSwitching).
-            guard !isLoggingIn, !isRefreshing, !isSwitching, activeAccount?.id == active.id else {
+            guard autoSwitchEnabled, autoSwitchPolicy == policy, !isLoggingIn, !isRefreshing, !isSwitching,
+                  activeAccount?.id == active.id, accounts.contains(where: { $0.id == target.id }) else {
                 log.info("[autoSwitch] State changed during verification; standing down")
                 return
             }
+
+            // The active window may have reset while the network request was
+            // in flight. Re-evaluate the trigger with the current clock.
+            guard let currentUtil = AutoSwitchEngine.bindingUtilization(accountUsage[active.id], requireKnownWindow: !activeSampledThisCycle),
+                  currentUtil >= policy.threshold(for: accountUsage[active.id], asOf: Date()) else { return }
+            failedAutoSwitchVerifications[target.id] = nil
 
             log.info("[autoSwitch] Switching to \(target.id), verified at \(String(format: "%.0f", verifiedUtil))%")
             lastAutoSwitchAt = Date()
@@ -592,6 +685,7 @@ final class AppState: ObservableObject {
             log.info("[fetchUsageNow] \(account.id) is rate-limit parked; no fresh reading available")
             return nil
         }
+        usageLastAttempt[account.id] = Date()
 
         let tokenJSON = account.isActive
             ? keychain.readClaudeToken()
@@ -632,6 +726,7 @@ final class AppState: ObservableObject {
 
     /// Re-authenticate an account by running `claude auth login` and capturing fresh credentials.
     func reauthenticateAccount(_ account: Account) async {
+        guard !isPreview else { return }
         log.info("[reauth] ===== Re-authenticating account \(account.id) (\(account.email)) =====")
         guard claudeAvailable else {
             errorMessage = String(localized: "Claude CLI not found", bundle: L10n.bundle)
@@ -639,7 +734,7 @@ final class AppState: ObservableObject {
         }
         // One credential mutation at a time — see loginNewAccount for why a
         // login during a suspended switch destroys a backup.
-        guard !isSwitching, !isLoggingIn else {
+        guard !isRefreshing, !isSwitching, !isLoggingIn else {
             log.warning("[reauth] Skipped: a switch or another login is in progress")
             return
         }
@@ -721,31 +816,11 @@ final class AppState: ObservableObject {
 
     // MARK: - Usage
 
-    /// Fetch usage with a single retry on 429 - but only when Retry-After is short.
-    /// Observed Retry-After values run into tens of minutes (long-window per-account
-    /// quota); retrying against those just burns more quota, so we rethrow instead
-    /// and let the caller park the account until the deadline.
-    private func fetchUsageWithRetry(accessToken: String) async throws -> UsageAPIResponse {
-        do {
-            return try await claudeService.getUsageLimits(accessToken: accessToken)
-        } catch ClaudeService.UsageError.rateLimited(let retryAfter) {
-            let delay = retryAfter ?? 15
-            guard delay <= 30 else {
-                throw ClaudeService.UsageError.rateLimited(retryAfter: retryAfter)
-            }
-            // Floor of 3s: "Retry-After: 0" is a momentary burst limiter, and an
-            // immediate (~1s) retry was observed to fail again.
-            log.warning("[fetchUsage] Rate-limited, retrying in \(String(format: "%.0f", max(delay, 3)))s...")
-            try? await Task.sleep(nanoseconds: UInt64(max(delay, 3) * 1_000_000_000))
-            return try await claudeService.getUsageLimits(accessToken: accessToken)
-        }
-    }
-
     /// Park an account until the server-given deadline (floor 60s — "Retry-After:
-    /// 0" burst rejections must still park; cap 1h; default 2min when no
+    /// 0" burst rejections must still park; default 2min when no
     /// Retry-After was sent). Every path that observes a 429 goes through here.
     private func park(_ account: Account, retryAfter: TimeInterval?) {
-        let parkFor = min(max(retryAfter ?? 120, 60), 3600)
+        let parkFor = max(retryAfter ?? 120, 60)
         usageRetryNotBefore[account.id] = Date().addingTimeInterval(parkFor)
         log.warning("[fetchUsage] \(account.id) rate-limited; parked for \(String(format: "%.0f", parkFor))s")
     }
@@ -839,18 +914,13 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func fetchAllAccountUsage() async {
-        // Pick this cycle's targets: the active account (always) + one non-active
-        // account in round-robin order. Stale samples for the others are kept.
-        // Accounts parked by a server-given Retry-After deadline are skipped.
-        let now = Date()
-        let eligible = accounts.filter { (usageRetryNotBefore[$0.id] ?? .distantPast) <= now }
-        let others = eligible.filter { !$0.isActive }
-        var targets = eligible.filter { $0.isActive }
-        if !others.isEmpty {
-            targets.append(others[usageFetchCursor % others.count])
-            usageFetchCursor += 1
-        }
+    private func fetchAllAccountUsage(refreshAll: Bool) async {
+        let targets = RefreshPolicy.usageTargets(
+            accounts: accounts, activeID: activeAccount?.id,
+            lastAttempt: usageLastAttempt, retryNotBefore: usageRetryNotBefore,
+            inactiveInterval: inactiveRefreshInterval, refreshAll: refreshAll,
+            usageByAccount: accountUsage, asOf: Date()
+        )
 
         // Only clear error state for the accounts we are about to sample;
         // the others keep both their stale usage and their error flags.
@@ -868,6 +938,8 @@ final class AppState: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
             isFirstRequest = false
+            guard !isLoggingIn, !isSwitching else { break }
+            usageLastAttempt[account.id] = Date()
 
             let tokenJSON: String?
             if account.isActive {
@@ -880,7 +952,9 @@ final class AppState: ObservableObject {
                 continue
             }
             do {
-                let usage = try await fetchUsageWithRetry(accessToken: accessToken)
+                // A rate limit parks this account immediately. Sleeping/retrying
+                // here would delay active-account monitoring behind idle accounts.
+                let usage = try await claudeService.getUsageLimits(accessToken: accessToken)
                 accountUsage[account.id] = usage
                 accountUsageSampledAt[account.id] = Date()
                 accountUsageErrors[account.id] = nil
