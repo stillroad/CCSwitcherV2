@@ -31,7 +31,11 @@ final class AppState: ObservableObject {
     @Published var activityStats: ActivityStats = .empty
     @Published var isRefreshingLocalStats = false
     @Published var lastLocalStatsRefresh: Date?
+    @Published var localStatsProgress = ""
+    @Published var localStatsMessage: String?
+    @Published var isStoppingLocalStats = false
     private var localStatsTask: Task<Void, Never>?
+    private var localStatsRunID: UUID?
 
     var hasCurrentLocalStats: Bool {
         lastLocalStatsRefresh.map { Calendar.current.isDateInToday($0) } ?? false
@@ -50,8 +54,9 @@ final class AppState: ObservableObject {
 
     private lazy var claudeService: any ClaudeAccountClient = ClaudeService.shared
     private let statsParser = StatsParser.shared
-    private let costParser = CostParser.shared
-    private let activityParser = ActivityParser.shared
+    private var localStatsCalculator: any LocalStatsCalculating = LocalStatsCalculator()
+    private var persistLocalStats: (LocalStatsSnapshot) -> Void = { $0.save() }
+    private var readsSupplementalLocalStats = true
     private lazy var keychain: any AccountCredentialStore = KeychainService.shared
 
     private var defaults: UserDefaults = .standard
@@ -162,13 +167,18 @@ final class AppState: ObservableObject {
     /// isolated defaults suite. No account restoration or widget publication.
     init(claudeService: any ClaudeAccountClient, keychain: any AccountCredentialStore,
          defaults: UserDefaults, now: @escaping () -> Date = Date.init,
-         pause: @escaping (TimeInterval) async -> Void = { _ in }) {
+         pause: @escaping (TimeInterval) async -> Void = { _ in },
+         localStatsCalculator: any LocalStatsCalculating = LocalStatsCalculator(),
+         persistLocalStats: @escaping (LocalStatsSnapshot) -> Void = { _ in }) {
         isPreview = false
         self.claudeService = claudeService
         self.keychain = keychain
         self.defaults = defaults
         self.now = now
         self.pause = pause
+        self.localStatsCalculator = localStatsCalculator
+        self.persistLocalStats = persistLocalStats
+        readsSupplementalLocalStats = false
         publishesWidgets = false
     }
 
@@ -210,8 +220,12 @@ final class AppState: ObservableObject {
         }
         lastUsageRefresh = now()
         updateWidgetData()
-        let interval = defaults.object(forKey: "localStatsInterval") as? Double ?? 86_400
-        if RefreshPolicy.localStatsDue(lastRefresh: lastLocalStatsRefresh, interval: interval, asOf: now()) {
+        let interval = defaults.object(forKey: "localStatsInterval") as? Double ?? 0
+        // Failures and cancellations count as attempts too, including after a
+        // relaunch. A large history must not restart at every usage poll.
+        let lastAttempt = defaults.object(forKey: "lastLocalStatsAttempt") as? Date
+        let lastRun = [lastLocalStatsRefresh, lastAttempt].compactMap { $0 }.max()
+        if RefreshPolicy.localStatsDue(lastRefresh: lastRun, interval: interval, asOf: now()) {
             refreshLocalStats()
         }
     }
@@ -274,25 +288,57 @@ final class AppState: ObservableObject {
     func refreshLocalStats() {
         guard !isPreview, localStatsTask == nil else { return }
         isRefreshingLocalStats = true
-        localStatsTask = Task(priority: .background) { [weak self] in
+        isStoppingLocalStats = false
+        localStatsMessage = nil
+        localStatsProgress = "Preparing local statistics…"
+        defaults.set(now(), forKey: "lastLocalStatsAttempt")
+        let runID = UUID()
+        localStatsRunID = runID
+        localStatsTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
                 self.isRefreshingLocalStats = false
+                self.isStoppingLocalStats = false
+                self.localStatsRunID = nil
                 self.localStatsTask = nil
             }
-            await SessionParseCacheV2.shared.refreshFromFilesystem()
-            self.costSummary = await self.costParser.getCostSummary()
-            self.activityStats = await self.activityParser.getTodayStats()
-            self.usageSummary = self.statsParser.getUsageSummary()
-            self.recentActivity = self.statsParser.getRecentActivity(days: 7)
-            self.activeSessions = self.statsParser.getActiveSessions()
-            let updatedAt = self.now()
-            self.lastLocalStatsRefresh = updatedAt
-            LocalStatsSnapshot(updatedAt: updatedAt, cost: self.costSummary,
-                               activity: self.activityStats).save()
-            self.updateWidgetData()
+            do {
+                let snapshot = try await self.localStatsCalculator.calculate(budget: .init()) { [weak self] text in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.localStatsRunID == runID, !self.isStoppingLocalStats else { return }
+                        self.localStatsProgress = text
+                    }
+                }
+                try Task.checkCancellation()
+                self.costSummary = snapshot.cost
+                self.activityStats = snapshot.activity
+                if self.readsSupplementalLocalStats {
+                    self.usageSummary = self.statsParser.getUsageSummary()
+                    self.recentActivity = self.statsParser.getRecentActivity(days: 7)
+                    self.activeSessions = self.statsParser.getActiveSessions()
+                }
+                self.lastLocalStatsRefresh = snapshot.updatedAt
+                self.persistLocalStats(snapshot)
+                self.updateWidgetData()
+            } catch is CancellationError {
+                self.localStatsMessage = "Calculation stopped. Previous statistics were kept."
+            } catch let error as LocalStatsError {
+                self.localStatsMessage = error.localizedDescription
+            } catch {
+                self.localStatsMessage = LocalStatsError.historyUnavailable.localizedDescription
+            }
         }
     }
+
+    func cancelLocalStats() {
+        guard let localStatsTask else { return }
+        isStoppingLocalStats = true
+        localStatsProgress = "Stopping calculation…"
+        localStatsTask.cancel()
+    }
+
+    /// Used by the isolated tests to await cleanup without polling the UI state.
+    func waitForLocalStats() async { await localStatsTask?.value }
 
     func startAutoRefresh(interval: TimeInterval = 300) {
         guard !isPreview else { return }

@@ -75,7 +75,7 @@ struct TokenUsage {
 }
 
 /// Aggregated cost for a single day.
-struct DailyCost: Identifiable, Codable {
+struct DailyCost: Identifiable, Codable, Sendable {
     let date: String // "yyyy-MM-dd"
     let totalCost: Double
     let modelBreakdown: [String: Double] // model -> cost
@@ -99,7 +99,7 @@ struct DailyCost: Identifiable, Codable {
 }
 
 /// Overall cost summary.
-struct CostSummary: Codable {
+struct CostSummary: Codable, Sendable {
     let todayCost: Double
     let dailyCosts: [DailyCost]
 

@@ -92,20 +92,23 @@ actor SessionParseCacheV2 {
     private static let currentVersion = 3
     private let claudeProjectsDir: String
     private let cacheURL: URL
+    private let refreshPricing: Bool
 
     private var files: [String: CachedFileV2] = [:]
     private var pricingMeta: PricingMeta = .init(source: "unknown", fetchedAt: nil)
     private var loaded = false
     private var needsSave = false
 
-    private init() {
-        self.claudeProjectsDir = NSHomeDirectory() + "/.claude/projects"
+    init(projectsDirectory: URL? = nil, cacheURL: URL? = nil, refreshPricing: Bool = true) {
+        self.claudeProjectsDir = projectsDirectory?.path ?? NSHomeDirectory() + "/.claude/projects"
+        self.refreshPricing = refreshPricing
 
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        let dir = appSupport.appendingPathComponent("CCSwitcher", isDirectory: true)
+        let dir = cacheURL?.deletingLastPathComponent()
+            ?? appSupport.appendingPathComponent("CCSwitcher", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.cacheURL = dir.appendingPathComponent("session-parse-cache-v2.json")
+        self.cacheURL = cacheURL ?? dir.appendingPathComponent("session-parse-cache-v2.json")
     }
 
     // MARK: Public API
@@ -114,8 +117,12 @@ actor SessionParseCacheV2 {
     /// has changed, evict missing files, persist the result. All work runs
     /// on the actor's executor; the actor is on the cooperative pool, not
     /// the main thread, so the UI is never blocked.
-    func refreshFromFilesystem() async {
+    func refreshFromFilesystem(budget: LocalStatsBudget = .init(),
+                               progress: @escaping LocalStatsProgress = { _ in }) async throws {
+        try budget.check()
+        progress("Loading saved statistics…")
         ensureLoaded()
+        try budget.check()
         await PricingService.shared.ensureLoaded()
         // Pick up a newer pricing snapshot the background download may have
         // written since launch — otherwise a long-lived session prices any
@@ -128,11 +135,13 @@ actor SessionParseCacheV2 {
         needsSave = needsSave || pricingMeta != newPricingMeta
         pricingMeta = newPricingMeta
         // Trigger a TTL'd background refresh of the LiteLLM JSON. No-op if fresh.
-        PricingService.shared.refreshInBackground()
+        if refreshPricing { PricingService.shared.refreshInBackground() }
 
         let start = Date()
         let cachedMtimes: [String: Double] = files.mapValues { $0.mtimeUnix }
-        let result = Self.scanAndParse(projectsDir: claudeProjectsDir, cachedMtimes: cachedMtimes)
+        let result = try Self.scanAndParse(projectsDir: claudeProjectsDir, cachedMtimes: cachedMtimes,
+                                          budget: budget, progress: progress)
+        try budget.check()
 
         for (path, entry) in result.updates {
             files[path] = entry
@@ -154,7 +163,11 @@ actor SessionParseCacheV2 {
         )
 
         needsSave = needsSave || !result.updates.isEmpty || evicted > 0
-        if needsSave { save() }
+        if needsSave {
+            progress("Saving statistics…")
+            save()
+        }
+        try budget.check()
     }
 
     /// Per-day, per-model cost summary. Applies global max-output-wins dedup
@@ -166,6 +179,11 @@ actor SessionParseCacheV2 {
     /// (date, model) level — which would let one fast or one 200k+ row
     /// contaminate every other row in its bucket.
     func costSummary() async -> CostSummary {
+        (try? await costSummary(budget: .init())) ?? .empty
+    }
+
+    func costSummary(budget: LocalStatsBudget) async throws -> CostSummary {
+        try budget.check()
         await PricingService.shared.ensureLoaded()
 
         // Sort files by earliest timestamp. Secondary sort by path string for
@@ -195,7 +213,11 @@ actor SessionParseCacheV2 {
         // table mid-summary and leave one result mixing old and new prices.
         var distinctModels: Set<String> = []
         for (_, file) in sortedFiles {
-            for e in file.entries { distinctModels.insert(e.model) }
+            try budget.check()
+            for e in file.entries {
+                try budget.check()
+                distinctModels.insert(e.model)
+            }
         }
         let priceCache = await PricingService.shared.prices(for: Array(distinctModels))
 
@@ -210,6 +232,7 @@ actor SessionParseCacheV2 {
         for (path, file) in sortedFiles {
             let sessionKey = file.sessionId ?? path
             for e in file.entries {
+                try budget.check()
                 let w = Winner(e: e, sessionKey: sessionKey)
                 guard let h = e.hash else { nilHashWinners.append(w); continue }
                 if let cur = bestByHash[h] {
@@ -223,6 +246,7 @@ actor SessionParseCacheV2 {
         var winners: [Winner] = Array(bestByHash.values)
         winners.append(contentsOf: nilHashWinners)
         for w in winners {
+            try budget.check()
             let e = w.e
             // ccusage strips `<synthetic>` from modelBreakdowns at aggregation
             // time. These rows are zero-token / zero-cost anyway (compaction
@@ -275,6 +299,7 @@ actor SessionParseCacheV2 {
             ))
         }
         dailyCosts.sort { $0.date > $1.date }
+        try budget.check()
 
         let todayStr = Self.localDateString(Date())
         let todayCost = dailyCosts.first(where: { $0.date == todayStr })?.totalCost ?? 0
@@ -316,6 +341,14 @@ actor SessionParseCacheV2 {
     /// debugging UIs and the Cost tab's "How We Calculate" line.
     func pricingMetaSnapshot() -> PricingMeta { pricingMeta }
 
+    /// Rare/manual scans should not keep hundreds of thousands of parsed rows
+    /// resident between runs. The disk cache and small UI snapshot are retained.
+    func releaseMemory() {
+        files = [:]
+        loaded = false
+        needsSave = false
+    }
+
     // MARK: - Scan & parse
 
     private struct ScanResult {
@@ -329,22 +362,28 @@ actor SessionParseCacheV2 {
 
     private static func scanAndParse(
         projectsDir: String,
-        cachedMtimes: [String: Double]
-    ) -> ScanResult {
+        cachedMtimes: [String: Double],
+        budget: LocalStatsBudget,
+        progress: LocalStatsProgress
+    ) throws -> ScanResult {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(atPath: projectsDir) else {
             log.warning("scan: cannot enumerate \(projectsDir)")
-            return ScanResult(livePaths: [], updates: [:], hits: 0, missesNew: 0, missesMtime: 0, parseElapsedMs: 0)
+            throw LocalStatsError.historyUnavailable
         }
 
         var live: Set<String> = []
         var updates: [String: CachedFileV2] = [:]
         var hits = 0, missesNew = 0, missesMtime = 0, parseMs = 0
+        var pending: [(path: String, relative: String, mtime: Double)] = []
 
+        progress("Checking session logs…")
         while let rel = enumerator.nextObject() as? String {
+            try budget.check()
             guard rel.hasSuffix(".jsonl") else { continue }
             let filePath = projectsDir + "/" + rel
-            guard let attrs = try? fm.attributesOfItem(atPath: filePath),
+            let attrs = try fm.attributesOfItem(atPath: filePath)
+            guard attrs[.type] as? FileAttributeType == .typeRegular,
                   let mtimeDate = attrs[.modificationDate] as? Date else { continue }
             let mtime = mtimeDate.timeIntervalSince1970
             live.insert(filePath)
@@ -354,11 +393,15 @@ actor SessionParseCacheV2 {
                 continue
             }
             if cachedMtimes[filePath] == nil { missesNew += 1 } else { missesMtime += 1 }
+            pending.append((filePath, rel, mtime))
+        }
 
+        for (index, item) in pending.enumerated() {
+            try budget.check()
+            progress("Reading changed log \(index + 1) of \(pending.count)…")
             let t0 = Date()
-            if let parsed = parseFile(at: filePath, relativePath: rel, mtime: mtime) {
-                updates[filePath] = parsed
-            }
+            let parsed = try parseFile(at: item.path, relativePath: item.relative, mtime: item.mtime, budget: budget)
+            updates[item.path] = parsed
             parseMs += Int(Date().timeIntervalSince(t0) * 1000)
         }
 
@@ -440,9 +483,8 @@ actor SessionParseCacheV2 {
 // Reads one JSONL file and produces (a) deduped per-file cost entries and
 // (b) per-date activity contributions. Pure: no actor state, no side effects.
 
-private func parseFile(at path: String, relativePath: String, mtime: Double) -> CachedFileV2? {
-    guard let data = FileManager.default.contents(atPath: path),
-          let content = String(data: data, encoding: .utf8) else { return nil }
+private func parseFile(at path: String, relativePath: String, mtime: Double,
+                       budget: LocalStatsBudget) throws -> CachedFileV2 {
 
     let isoMain = ISO8601DateFormatter()
     isoMain.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -480,18 +522,16 @@ private func parseFile(at path: String, relativePath: String, mtime: Double) -> 
 
     // Strict schema regexes — originally lifted from ccusage 18.0.11's JS parser;
     // the row-acceptance schema is unchanged in 20.x (token columns still reconcile).
-    // Bare patterns; ranges checked with `.regularExpression`.
-    let timestampPattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$"#
-    let versionPattern   = #"^\d+\.\d+\.\d+"#
+    // Compile once per file, rather than compiling a regex for every log row.
+    let timestampPattern = try NSRegularExpression(pattern: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$"#)
+    let versionPattern = try NSRegularExpression(pattern: #"^\d+\.\d+\.\d+"#)
 
-    content.enumerateLines { line, _ in
-        guard !line.isEmpty,
-              let lineData = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
+    try JSONLReader.forEachLine(at: URL(fileURLWithPath: path), budget: budget) { lineData in
+        guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
         else { return }
 
         guard let timestampStr = obj["timestamp"] as? String,
-              timestampStr.range(of: timestampPattern, options: .regularExpression) != nil,
+              timestampPattern.firstMatch(in: timestampStr, range: NSRange(timestampStr.startIndex..., in: timestampStr)) != nil,
               let timestamp = isoMain.date(from: timestampStr) ?? isoAlt.date(from: timestampStr)
         else { return }
 
@@ -499,7 +539,7 @@ private func parseFile(at path: String, relativePath: String, mtime: Double) -> 
         // Code writes occasionally produce non-version strings here.
         if let v = obj["version"] {
             guard let vs = v as? String,
-                  vs.range(of: versionPattern, options: .regularExpression) != nil else { return }
+                  versionPattern.firstMatch(in: vs, range: NSRange(vs.startIndex..., in: vs)) != nil else { return }
         }
 
         if earliest == nil || timestamp < earliest! { earliest = timestamp }
@@ -641,6 +681,7 @@ private func parseFile(at path: String, relativePath: String, mtime: Double) -> 
         .union(perDayLines.keys)
         .union(perDayTimestamps.keys)
     for date in allDates {
+        try budget.check()
         let active = calculateActiveMinutes(perDayTimestamps[date] ?? [])
         let c = ActivityDayContributionV2(
             turns: perDayTurns[date] ?? 0,

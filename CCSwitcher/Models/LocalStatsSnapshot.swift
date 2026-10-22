@@ -2,7 +2,7 @@ import Foundation
 
 /// Small aggregate snapshot, separate from the potentially huge parse cache.
 /// Relaunching the app must not trigger another full scan before the next day.
-struct LocalStatsSnapshot: Codable {
+struct LocalStatsSnapshot: Codable, Sendable {
     let updatedAt: Date
     let cost: CostSummary
     let activity: ActivityStats

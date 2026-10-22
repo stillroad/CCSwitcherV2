@@ -105,7 +105,7 @@ final class RefreshPolicyTests: XCTestCase {
                                                    autoSwitchEnabled: true, policy: policy, asOf: now), 15)
     }
 
-    func testLocalStatisticsDefaultDailyCadenceAndManualOnlyOption() {
+    func testLocalStatisticsDailyCadenceAndManualOnlyOption() {
         XCTAssertTrue(RefreshPolicy.localStatsDue(lastRefresh: nil, interval: 86_400, asOf: now))
         XCTAssertFalse(RefreshPolicy.localStatsDue(lastRefresh: now.addingTimeInterval(-300), interval: 86_400, asOf: now))
         XCTAssertTrue(RefreshPolicy.localStatsDue(lastRefresh: now.addingTimeInterval(-86_400), interval: 86_400, asOf: now))

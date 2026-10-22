@@ -9,9 +9,13 @@ struct LocalStatsStatusView: View {
             if appState.isRefreshingLocalStats {
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text("Calculating local statistics…").font(.caption)
+                    Text(appState.localStatsProgress).font(.caption)
+                    Spacer()
+                    Button("Stop") { appState.cancelLocalStats() }
+                        .controlSize(.small)
+                        .disabled(appState.isStoppingLocalStats)
                 }
-                Text("Account usage checks and switching continue.")
+                Text("Stops after one minute. Account usage checks and switching continue.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
@@ -29,6 +33,9 @@ struct LocalStatsStatusView: View {
                     Spacer()
                     Button("Calculate now") { appState.refreshLocalStats() }
                         .controlSize(.small)
+                }
+                if let message = appState.localStatsMessage {
+                    Text(message).font(.caption2).foregroundStyle(.secondary)
                 }
             }
         }

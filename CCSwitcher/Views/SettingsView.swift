@@ -13,7 +13,7 @@ struct SettingsView: View {
     @AppStorage("autoSwitchEnabled") private var autoSwitchEnabled = false
     @AppStorage("autoSwitchThreshold") private var autoSwitchThreshold = 90.0
     @AppStorage("inactiveRefreshInterval") private var inactiveRefreshInterval = RefreshPolicy.defaultInactiveInterval
-    @AppStorage("localStatsInterval") private var localStatsInterval = 86_400.0
+    @AppStorage("localStatsInterval") private var localStatsInterval = 0.0
     @AppStorage("autoSwitchStrategy") private var autoSwitchStrategy = AutoSwitchEngine.Strategy.soonestReset.rawValue
     @AppStorage("useNearResetThreshold") private var useNearResetThreshold = true
     @State private var launchAtLogin = false

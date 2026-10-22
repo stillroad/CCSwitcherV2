@@ -22,7 +22,7 @@ Personal fork of [XueshiQiao/CCSwitcher](https://github.com/XueshiQiao/CCSwitche
 - Active usage keeps its own refresh interval and speeds up near the switching threshold.
 - Inactive accounts refresh hourly by default, one at a time; startup and the manual refresh button sample all accounts.
 - Auto-switch can prefer the soonest **weekly reset**, with a 99% threshold during the final 48 hours.
-- Local cost/activity statistics run **once a day** or on request, independently of usage checks and switching.
+- Local cost/activity statistics run **only when requested** by default; daily calculation is optional. Scans are cancellable and stop after a one-minute budget, independently of usage checks and switching.
 - Upstream automatic updates are disabled in the personal build.
 
 Run `swift test` for the policy and account-coordination tests with synthetic credentials and `scripts/build-personal.sh` for a universal, locally signed app and ZIP (Apple Silicon + Intel).

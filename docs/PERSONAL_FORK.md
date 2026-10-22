@@ -1,14 +1,18 @@
 # Personal fork
 
-Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.1 (67).
+Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.2 (68).
 
 ## Why the CPU was high
 
 A three-second sample of the running upstream app showed its busy thread in `SessionParseCacheV2.scanAndParse` / `parseFile`, including JSON decoding and timestamp parsing. One recorded refresh walked 3,911 files, reparsed 22 changed files for about 211 seconds, and wrote a 236 MB parse cache. Upstream already caches unchanged files and polls active + one inactive account, so reducing account requests alone would not address that scan.
 
-The fork removes local log parsing from the usage-refresh path. It runs as a separate background task, once per day by default, with an independent overlap guard. Account monitoring and automatic switching continue while it works. A small aggregate snapshot preserves the last calculation time and results across restarts. Cost/activity cards show their own calculation time; yesterday's snapshot is not presented as today's usage. Unchanged parse caches are no longer rewritten.
+The fork removes local log parsing from the usage-refresh path. As of 1.12.2, it runs **only when requested** by default, with an optional daily schedule and an independent overlap guard. An explicitly selected schedule is preserved. Account monitoring and automatic switching continue while it works. A small aggregate snapshot preserves the last calculation time and results across restarts. Cost/activity cards show their own calculation time; yesterday's snapshot is not presented as today's usage. Unchanged parse caches are no longer rewritten.
 
-This changes when expensive scans run; it does not make the JSONL parser incremental. A requested/daily scan can still consume CPU while running. Choose **Only when requested** to eliminate automatic scans entirely.
+Version 1.12.1 exposed a large-history case: multi-GB changed logs could leave the first calculation spinning for many minutes. Version 1.12.2 reads logs in 64 KB chunks, checks cancellation and a monotonic one-minute budget inside each file, and shows the current phase and a **Stop** button. It reads only the file length captured when the file is opened, so new appends cannot extend a scan indefinitely. A record over 8 MB ends the calculation with an explanation instead of allocating an unbounded buffer. Timestamp/version regexes are compiled once per file.
+
+Cancelled, failed and timed-out scans keep the previous complete statistics and do not publish partial results as fresh. Attempts also advance the automatic schedule, persisted across relaunches, so a failed scan cannot restart every time account usage refreshes. The deadline is cooperative: an individual system read, bounded record decode or cache load/save must return before the next check can stop it.
+
+The large in-memory parse cache is released when calculation finishes, fails or is stopped. The disk cache and small display snapshot remain. The parser is still not incremental within a changed file. Very large histories may exceed the budget and leave cost/activity statistics unavailable or outdated; there is no automatic retry loop. Account quota data and switching remain independent. Leave **Only when requested** selected to avoid background log scanning.
 
 ## Usage checks
 
@@ -84,9 +88,11 @@ The personal-build flag prevents Sparkle from being initialized even if the exis
 
 ## Validation
 
-The 2026-10-22 audit passed **51 automated tests**. The Release app and widget compiled for both architectures, and the packaged app passed strict signature verification. Live OAuth swaps, Intel execution and registration on a second Mac were not exercised.
+The 2026-10-22 audit and local-statistics regression suite passed **64 automated tests**. The Release app and widget compiled for both architectures, and the packaged app passed strict signature verification. Live OAuth swaps, Intel execution and registration on a second Mac were not exercised.
 
 `swift test` covers reset ordering, both threshold modes, exact 48-hour/99% boundaries, invalid and stale readings, provider isolation, cooldown exceptions, nine-account scheduling, server backoff, reset-triggered refreshes, adaptive active polling, daily statistics scheduling and snapshot persistence. It also exercises the actual AppState orchestration with injected in-memory services: concurrent credential operations, a nine-account slow sweep, failed removal, changed external identity, backup write failure, stale candidate verification and long backoff. Subprocess tests use harmless local commands to cover pipe saturation, timeout, output limits and exit codes. Credential transaction tests inject write and verification failures. No test reads real credentials or contacts Claude. Test preference suites and files are isolated and cleaned up.
+
+Statistics regression tests cover a 4 GB sparse file without loading it into memory, chunk boundaries and UTF-8, appending/truncating logs during a read, within-file deadlines and cancellation, maximum-output deduplication, preservation of the complete cache after failure, and unavailable history. AppState tests verify spinner cleanup, no repeated retries after failure/relaunch, manual defaults, and account polling while a statistics job is running.
 
 `CCSwitcherPreview` is an isolated native settings preview target. It uses its own preferences domain and an empty AppState; it never starts account polling or restores credentials. The new controls were inspected in this preview. The Release application and widget are also compiled together.
 

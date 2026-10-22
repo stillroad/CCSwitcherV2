@@ -71,6 +71,7 @@ let package = Package(
                 "CCSwitcher/Services/FileLogger.swift",
                 "CCSwitcher/Services/KeychainService.swift",
                 "CCSwitcher/Services/L10n.swift",
+                "CCSwitcher/Services/LocalStatsWork.swift",
                 "CCSwitcher/Services/PricingService.swift",
                 "CCSwitcher/Services/SessionParseCache.swift",
                 "CCSwitcher/Services/SessionParseCacheV2.swift",

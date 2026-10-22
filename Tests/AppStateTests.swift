@@ -73,6 +73,19 @@ private final class FakeClaude: ClaudeAccountClient {
 }
 
 @MainActor
+private final class FakeLocalStats: LocalStatsCalculating {
+    var calls = 0
+    var work: (() async throws -> LocalStatsSnapshot)?
+
+    func calculate(budget: LocalStatsBudget, progress: @escaping LocalStatsProgress) async throws -> LocalStatsSnapshot {
+        calls += 1
+        progress("Reading test history…")
+        if let work { return try await work() }
+        return LocalStatsSnapshot(updatedAt: Date(), cost: .empty, activity: .empty)
+    }
+}
+
+@MainActor
 private final class TestClock {
     var date = Date()
     func advance(_ seconds: TimeInterval) { date.addTimeInterval(seconds) }
@@ -86,6 +99,7 @@ private final class Harness {
     let client: FakeClaude
     let state: AppState
     let accounts: [Account]
+    let localStats = FakeLocalStats()
     init(count: Int = 3, autoSwitch: Bool = false, clock: TestClock? = nil) {
         defaults = UserDefaults(suiteName: suite)!
         defaults.set(0.0, forKey: "localStatsInterval")
@@ -98,7 +112,8 @@ private final class Harness {
         }
         client = FakeClaude(store: store, email: accounts[0].email)
         state = AppState(claudeService: client, keychain: store, defaults: defaults,
-                         now: { clock?.date ?? Date() }, pause: { clock?.advance($0) })
+                         now: { clock?.date ?? Date() }, pause: { clock?.advance($0) },
+                         localStatsCalculator: localStats)
         state.accounts = accounts
         state.activeAccount = accounts[0]
         state.claudeAvailable = true
@@ -114,6 +129,7 @@ private final class Harness {
     func cleanup() {
         client.onUsage = nil
         client.onRotation = nil
+        localStats.work = nil
         defaults.removePersistentDomain(forName: suite)
     }
     static func token(_ id: String) -> String { "{\"claudeAiOauth\":{\"accessToken\":\"\(id)\"}}" }
@@ -126,6 +142,82 @@ private final class Harness {
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    func testLocalStatisticsDefaultToManualWithoutChangingUsagePolling() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.defaults.removeObject(forKey: "localStatsInterval")
+        await h.state.refresh()
+        XCTAssertFalse(h.state.isRefreshingLocalStats)
+        XCTAssertEqual(h.localStats.calls, 0)
+        XCTAssertTrue(h.client.usageCalls.contains("t0"))
+    }
+
+    func testLocalStatsFailureClearsSpinnerKeepsSnapshotAndDoesNotRetryOnUsagePoll() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.defaults.set(86_400.0, forKey: "localStatsInterval")
+        let previous = Date().addingTimeInterval(-2 * 86_400)
+        h.state.lastLocalStatsRefresh = previous
+        h.state.costSummary = CostSummary(todayCost: 12, dailyCosts: [])
+        h.localStats.work = { throw LocalStatsError.timeLimit }
+        await h.state.refresh()
+        await h.state.waitForLocalStats()
+        XCTAssertFalse(h.state.isRefreshingLocalStats)
+        XCTAssertEqual(h.state.lastLocalStatsRefresh, previous)
+        XCTAssertEqual(h.state.costSummary.todayCost, 12)
+        XCTAssertNotNil(h.state.localStatsMessage)
+        await h.state.refresh()
+        XCTAssertEqual(h.localStats.calls, 1)
+        // A relaunch still uses the persisted failed-attempt time.
+        let relaunched = AppState(claudeService: h.client, keychain: h.store, defaults: h.defaults,
+                                 localStatsCalculator: h.localStats)
+        relaunched.accounts = h.accounts
+        relaunched.activeAccount = h.accounts[0]
+        await relaunched.refresh()
+        XCTAssertEqual(h.localStats.calls, 1)
+    }
+
+    func testLocalStatsCancellationStopsWorkAndUsageChecksContinueDuringCalculation() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        let started = expectation(description: "statistics started")
+        h.localStats.work = {
+            started.fulfill()
+            try await Task.sleep(for: .seconds(5))
+            return LocalStatsSnapshot(updatedAt: Date(), cost: .empty, activity: .empty)
+        }
+        h.state.refreshLocalStats()
+        await fulfillment(of: [started], timeout: 2)
+        h.state.refreshLocalStats()
+        XCTAssertEqual(h.localStats.calls, 1)
+        await h.state.refresh()
+        XCTAssertTrue(h.client.usageCalls.contains("t0"))
+        h.state.cancelLocalStats()
+        await h.state.waitForLocalStats()
+        XCTAssertFalse(h.state.isRefreshingLocalStats)
+        XCTAssertFalse(h.state.isStoppingLocalStats)
+        XCTAssertNil(h.state.lastLocalStatsRefresh)
+        XCTAssertNotNil(h.state.localStatsMessage)
+    }
+
+    func testSuccessfulLocalStatsCalculationClearsOldFailureAndPublishesCompleteResult() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.state.localStatsMessage = "Previous failure"
+        let date = Date()
+        h.localStats.work = {
+            LocalStatsSnapshot(updatedAt: date, cost: CostSummary(todayCost: 4.5, dailyCosts: []),
+                               activity: ActivityStats(conversationTurns: 7))
+        }
+        h.state.refreshLocalStats()
+        await h.state.waitForLocalStats()
+        XCTAssertFalse(h.state.isRefreshingLocalStats)
+        XCTAssertNil(h.state.localStatsMessage)
+        XCTAssertEqual(h.state.lastLocalStatsRefresh, date)
+        XCTAssertEqual(h.state.costSummary.todayCost, 4.5)
+        XCTAssertEqual(h.state.activityStats.conversationTurns, 7)
+    }
+
     func testLoginDoesNotOverwriteCredentialsWhenBackupFails() async {
         let h = Harness()
         defer { h.cleanup() }
