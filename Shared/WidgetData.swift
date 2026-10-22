@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The main app (non-sandboxed) writes a JSON file into the widget extension's container directory.
 /// The widget (sandboxed) reads from its own Application Support, which maps to the same path.
-struct WidgetAccountData: Codable {
+struct WidgetAccountData: Codable, Equatable {
     let email: String          // pre-obfuscated
     let displayName: String    // pre-obfuscated
     let subscriptionType: String?
@@ -26,6 +26,17 @@ struct WidgetData: Codable {
     let linesWritten: Int
     let modelUsage: [String: Int]
     let lastUpdated: Date
+    var localStatsUpdatedAt: Date? = nil
+
+    var hasCurrentLocalStats: Bool {
+        localStatsUpdatedAt.map { Calendar.current.isDateInToday($0) } ?? false
+    }
+
+    func hasSameContent(as other: WidgetData) -> Bool {
+        accounts == other.accounts && todayCost == other.todayCost && conversationTurns == other.conversationTurns
+            && activeCodingTime == other.activeCodingTime && linesWritten == other.linesWritten
+            && modelUsage == other.modelUsage && localStatsUpdatedAt == other.localStatsUpdatedAt
+    }
 
     // Team-ID-prefixed App Group. macOS Sequoia (15+) prompts for App
     // Management on `group.<bundle-id>` style identifiers; the
@@ -47,11 +58,15 @@ struct WidgetData: Codable {
     }
 
     /// Save to the shared App Group container.
-    func save() {
-        guard let containerURL = Self.sharedContainerURL else { return }
+    @discardableResult
+    func save() -> Bool {
+        guard let containerURL = Self.sharedContainerURL else { return false }
         let fileURL = containerURL.appendingPathComponent(Self.fileName)
-        if let data = try? JSONEncoder().encode(self) {
-            try? data.write(to: fileURL, options: .atomic)
+        do {
+            try JSONEncoder().encode(self).write(to: fileURL, options: .atomic)
+            return true
+        } catch {
+            return false
         }
     }
 }

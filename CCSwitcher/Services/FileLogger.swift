@@ -12,10 +12,18 @@ struct FileLog: Sendable {
         self.category = category
     }
 
+    #if SWIFT_PACKAGE
+    // Unit tests must not create, rotate or delete the user's application logs.
+    func info(_ message: String) {}
+    func warning(_ message: String) {}
+    func error(_ message: String) {}
+    func debug(_ message: String) {}
+    #else
     func info(_ message: String) { FileLog.shared.write("INFO", category, message) }
     func warning(_ message: String) { FileLog.shared.write("WARN", category, message) }
     func error(_ message: String) { FileLog.shared.write("ERROR", category, message) }
     func debug(_ message: String) { FileLog.shared.write("DEBUG", category, message) }
+    #endif
 }
 
 private final class FileLogWriter: @unchecked Sendable {

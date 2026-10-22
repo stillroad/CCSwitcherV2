@@ -4,9 +4,26 @@ import Foundation
 enum RefreshPolicy {
     static let defaultInactiveInterval: TimeInterval = 60 * 60
 
+    /// Retry-After can be a delay in seconds or an HTTP date.
+    static func retryAfter(_ value: String?, asOf now: Date) -> TimeInterval? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let seconds = TimeInterval(trimmed), seconds.isFinite { return max(0, seconds) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: trimmed).map { max(0, $0.timeIntervalSince(now)) }
+    }
+
     static func isDue(lastAttempt: Date?, interval: TimeInterval, asOf now: Date) -> Bool {
         guard let lastAttempt else { return true }
         return now.timeIntervalSince(lastAttempt) >= interval
+    }
+
+    static func isFreshSample(_ sample: Date?, cycleStart: Date, asOf now: Date) -> Bool {
+        guard let sample else { return false }
+        return sample >= cycleStart && now.timeIntervalSince(sample) <= 30 && sample <= now
     }
 
     /// Tighten checks as the active account approaches its switching threshold.

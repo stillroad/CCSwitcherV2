@@ -50,8 +50,8 @@ struct CCSwitcherApp: App {
                     Task {
                         // Seed reset ordering once at launch. Later timer cycles
                         // only poll the active account and one due inactive account.
-                        await appState.refresh(allAccounts: true)
                         appState.startAutoRefresh(interval: refreshInterval)
+                        await appState.refresh(allAccounts: true)
                     }
                 }
                 .onChange(of: appLanguage) { _, _ in

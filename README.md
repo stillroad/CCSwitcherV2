@@ -25,7 +25,8 @@ Personal fork of [XueshiQiao/CCSwitcher](https://github.com/XueshiQiao/CCSwitche
 - Local cost/activity statistics run **once a day** or on request, independently of usage checks and switching.
 - Upstream automatic updates are disabled in the personal build.
 
-Run `swift test` for the credential-free policy tests and `scripts/build-personal.sh` for a locally signed app and ZIP.
+Run `swift test` for the policy and account-coordination tests with synthetic credentials and `scripts/build-personal.sh` for a universal, locally signed app and ZIP (Apple Silicon + Intel).
+Download the personal build from [this fork’s releases](https://github.com/stillroad/CCSwitcherV2/releases).
 See [the personal fork guide](docs/PERSONAL_FORK.md) for behavior, installation and validation details.
 
 ## Upstream project

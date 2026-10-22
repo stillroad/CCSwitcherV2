@@ -29,6 +29,26 @@ final class RefreshPolicyTests: XCTestCase {
         XCTAssertEqual(targets(retry: [idle.id: now], all: true), [active.id, idle.id])
     }
 
+    func testRetryAfterParsesSecondsAndHTTPDates() {
+        XCTAssertEqual(RefreshPolicy.retryAfter("7200", asOf: now), 7200)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        let header = formatter.string(from: now.addingTimeInterval(7200))
+        XCTAssertEqual(RefreshPolicy.retryAfter(header, asOf: now), 7200)
+        XCTAssertNil(RefreshPolicy.retryAfter("nan", asOf: now))
+        XCTAssertNil(RefreshPolicy.retryAfter("infinity", asOf: now))
+        XCTAssertNil(RefreshPolicy.retryAfter("invalid", asOf: now))
+        XCTAssertEqual(RefreshPolicy.retryAfter("-1", asOf: now), 0)
+    }
+
+    func testLongSweepDoesNotTreatOldSamplesAsFresh() {
+        XCTAssertTrue(RefreshPolicy.isFreshSample(now.addingTimeInterval(-20), cycleStart: now.addingTimeInterval(-120), asOf: now))
+        XCTAssertFalse(RefreshPolicy.isFreshSample(now.addingTimeInterval(-40), cycleStart: now.addingTimeInterval(-120), asOf: now))
+        XCTAssertFalse(RefreshPolicy.isFreshSample(now.addingTimeInterval(-20), cycleStart: now.addingTimeInterval(-10), asOf: now))
+    }
+
     func testNineAccountsAreStaggeredFairly() {
         let others = (0..<8).map { Account(email: "idle\($0)@example.test", displayName: "Idle \($0)") }
         var attempts: [UUID: Date] = [:]

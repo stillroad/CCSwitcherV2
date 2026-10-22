@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 /// Settings editor for the menu-bar modules: a reorderable list of all
 /// available modules with a toggle per row, plus a live preview showing

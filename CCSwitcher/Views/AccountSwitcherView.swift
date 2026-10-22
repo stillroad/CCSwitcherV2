@@ -148,7 +148,7 @@ struct AccountSwitcherView: View {
             .help("Re-authenticate (fix stale token)")
 
             Button {
-                appState.removeAccount(account)
+                Task { await appState.removeAccount(account) }
             } label: {
                 Image(systemName: "trash")
                     .font(.caption)

@@ -145,9 +145,10 @@ enum AutoSwitchEngine {
         return candidates
             .compactMap { candidate -> (account: Account, utilization: Double, reset: Date)? in
                 let usage = usageByAccount[candidate.id]
-                guard candidate.id != active.id, candidate.provider == active.provider, isSwitchable(candidate),
+                guard candidate.id != active.id, candidate.provider == active.provider,
                       let util = bindingUtilization(usageByAccount[candidate.id], asOf: now),
-                      util <= policy.candidateCeiling(for: usage, asOf: now) else { return nil }
+                      util <= policy.candidateCeiling(for: usage, asOf: now),
+                      isSwitchable(candidate) else { return nil }
                 let reset = usage?.sevenDay?.resetsAtDate
                 return (candidate, util, reset.flatMap { $0 > now ? $0 : nil } ?? .distantFuture)
             }

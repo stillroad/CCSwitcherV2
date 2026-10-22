@@ -34,7 +34,8 @@ struct CCSwitcherEntry: TimelineEntry {
             activeCodingTime: "1h 30m",
             linesWritten: 326,
             modelUsage: ["Fable": 18, "Opus": 12, "Sonnet": 5, "Haiku": 1],
-            lastUpdated: .now
+            lastUpdated: .now,
+            localStatsUpdatedAt: .now
         )
     )
 }
@@ -171,7 +172,7 @@ private struct SmallWidgetView: View {
 
                 // Today's cost
                 HStack {
-                    Text(formatCost(data.todayCost))
+                    Text((data.hasCurrentLocalStats ? formatCost(data.todayCost) : "—"))
                         .font(.title3.weight(.semibold).monospacedDigit())
                         .foregroundStyle(.green)
                     Text("today")
@@ -311,13 +312,13 @@ private struct MediumWidgetView: View {
                 // Right: Activity stats
                 VStack(alignment: .leading, spacing: 0) {
                     Spacer(minLength: 0)
-                    statRow(icon: "dollarsign.circle", label: "Cost", value: formatCost(data.todayCost), valueColor: .green)
+                    statRow(icon: "dollarsign.circle", label: "Cost", value: (data.hasCurrentLocalStats ? formatCost(data.todayCost) : "—"), valueColor: .green)
                     Spacer(minLength: 4)
-                    statRow(icon: "bubble.left.and.bubble.right", label: "Turns", value: "\(data.conversationTurns)")
+                    statRow(icon: "bubble.left.and.bubble.right", label: "Turns", value: (data.hasCurrentLocalStats ? "\(data.conversationTurns)" : "—"))
                     Spacer(minLength: 4)
-                    statRow(icon: "clock", label: "Active", value: data.activeCodingTime)
+                    statRow(icon: "clock", label: "Active", value: data.hasCurrentLocalStats ? data.activeCodingTime : "—")
                     Spacer(minLength: 4)
-                    statRow(icon: "doc.text", label: "Lines", value: "\(data.linesWritten)")
+                    statRow(icon: "doc.text", label: "Lines", value: (data.hasCurrentLocalStats ? "\(data.linesWritten)" : "—"))
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -397,13 +398,13 @@ private struct LargeWidgetView: View {
             // Today's activity + model usage
             VStack(spacing: 6) {
                 HStack(spacing: 0) {
-                    activityStat(icon: "bubble.left.and.bubble.right", value: "\(data.conversationTurns)", label: "Turns")
-                    activityStat(icon: "clock", value: data.activeCodingTime, label: "Active")
-                    activityStat(icon: "doc.text", value: "\(data.linesWritten)", label: "Lines")
-                    activityStat(icon: "dollarsign.circle", value: formatCost(data.todayCost), label: "Cost", valueColor: .green)
+                    activityStat(icon: "bubble.left.and.bubble.right", value: (data.hasCurrentLocalStats ? "\(data.conversationTurns)" : "—"), label: "Turns")
+                    activityStat(icon: "clock", value: data.hasCurrentLocalStats ? data.activeCodingTime : "—", label: "Active")
+                    activityStat(icon: "doc.text", value: (data.hasCurrentLocalStats ? "\(data.linesWritten)" : "—"), label: "Lines")
+                    activityStat(icon: "dollarsign.circle", value: (data.hasCurrentLocalStats ? formatCost(data.todayCost) : "—"), label: "Cost", valueColor: .green)
                 }
 
-                if !data.modelUsage.isEmpty {
+                if data.hasCurrentLocalStats && !data.modelUsage.isEmpty {
                     Rectangle()
                         .fill(.quaternary)
                         .frame(height: 0.5)

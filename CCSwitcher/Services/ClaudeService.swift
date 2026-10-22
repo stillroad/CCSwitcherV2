@@ -75,7 +75,7 @@ final class ClaudeService: @unchecked Sendable {
 
     /// Today's 3-tier fallback: curated → shell PATH → bare "claude".
     static func autoSelectedPath() -> (path: String, source: String) {
-        for candidate in curatedPathCandidates() where FileManager.default.fileExists(atPath: candidate) {
+        for candidate in curatedPathCandidates() where FileManager.default.isExecutableFile(atPath: candidate) {
             return (candidate, "curated")
         }
         if let shellPath = shellPathLookup() {
@@ -151,45 +151,11 @@ final class ClaudeService: @unchecked Sendable {
     /// pnpm/yarn/bun/Volta with non-default prefixes, custom npm prefixes, etc.).
     /// Bounded by a short timeout so a slow .zshrc can't block app launch.
     private static func shellPathLookup() -> String? {
-        let process = Process()
-        let stdout = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-ilc", "command -v claude"]
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-        process.environment = ProcessInfo.processInfo.environment
-
-        do {
-            try process.run()
-        } catch {
-            log.warning("[shellPathLookup] Failed to launch /bin/zsh: \(error.localizedDescription)")
-            return nil
-        }
-
-        // Hard timeout — don't let a heavy shell rc file block forever.
-        let deadline = Date().addingTimeInterval(3.0)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if process.isRunning {
-            process.terminate()
-            log.warning("[shellPathLookup] zsh exceeded 3s timeout; aborting")
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else { return nil }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        let raw = String(data: data, encoding: .utf8) ?? ""
-        // `command -v` may emit multiple lines if claude is shadowed; take the first.
-        let candidate = raw
-            .split(whereSeparator: \.isNewline)
-            .first
-            .map(String.init)?
-            .trimmingCharacters(in: .whitespaces) ?? ""
-        guard candidate.hasPrefix("/"),
-              FileManager.default.isExecutableFile(atPath: candidate) else {
-            return nil
-        }
+        guard let result = try? BoundedProcess.runBlocking(executable: "/bin/zsh",
+                                                          arguments: ["-ilc", "command -v claude"], timeout: 3),
+              result.status == 0,
+              let candidate = result.stdout.split(whereSeparator: \.isNewline).first.map(String.init),
+              candidate.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: candidate) else { return nil }
         return candidate
     }
 
@@ -208,15 +174,19 @@ final class ClaudeService: @unchecked Sendable {
     }
 
     func isClaudeAvailable() async -> Bool {
-        do {
-            let version = try await runClaude(args: ["--version"])
-            log.info("[isClaudeAvailable] YES, version: \(version.trimmingCharacters(in: .whitespacesAndNewlines))")
-            return true
-        } catch {
-            log.error("[isClaudeAvailable] NO, error: \(error.localizedDescription)")
-            return false
-        }
+        // No need to launch a second Claude process on every quota poll. Auth
+        // status below reports launch/runtime failures; this checks installation.
+        FileManager.default.isExecutableFile(atPath: claudePath)
     }
+
+    private static let apiSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        configuration.waitsForConnectivity = false
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }()
 
     // MARK: - Usage API
 
@@ -239,7 +209,7 @@ final class ClaudeService: @unchecked Sendable {
 
         log.debug("[getUsageLimits] REQUEST URL: \(url.absoluteString)")
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let (responseData, response) = try await Self.apiSession.data(for: request)
         let httpResponse = response as? HTTPURLResponse
         guard httpResponse?.statusCode == 200 else {
             let responseString = String(data: responseData, encoding: .utf8) ?? ""
@@ -249,8 +219,7 @@ final class ClaudeService: @unchecked Sendable {
                 throw UsageError.expired
             }
             if httpResponse?.statusCode == 429 {
-                let retryAfter = httpResponse?.value(forHTTPHeaderField: "Retry-After")
-                    .flatMap(TimeInterval.init)
+                let retryAfter = RefreshPolicy.retryAfter(httpResponse?.value(forHTTPHeaderField: "Retry-After"), asOf: Date())
                 log.warning("[getUsageLimits] 429, Retry-After: \(retryAfter.map { String(format: "%.0f", $0) } ?? "none")s")
                 throw UsageError.rateLimited(retryAfter: retryAfter)
             }
@@ -316,7 +285,7 @@ final class ClaudeService: @unchecked Sendable {
         ])
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await Self.apiSession.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200,
                   let resp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -391,42 +360,31 @@ final class ClaudeService: @unchecked Sendable {
     /// `targetBackup` is resolved by the caller (which can distinguish a
     /// missing backup from a briefly unreadable store) and handed down so no
     /// second, ambiguity-collapsing lookup happens here.
-    @discardableResult
-    func switchAccount(from currentAccount: Account, to targetAccount: Account, targetBackup: AccountBackup) async throws -> SwitchOutcome {
+    @MainActor @discardableResult
+    func switchAccount(from currentAccount: Account?, to targetAccount: Account, targetBackup: AccountBackup) async throws -> SwitchOutcome {
         let keychain = KeychainService.shared
-
-        log.info("[switchAccount] Switching from \(currentAccount.id) to \(targetAccount.id)")
-
-        // 1. Back up current account (token + oauthAccount)
-        log.info("[switchAccount] Step 1: Backing up current account...")
-        if let currentToken = keychain.readClaudeToken(),
-           let currentOAuth = keychain.readOAuthAccount() {
-            let email = (currentOAuth["emailAddress"]?.value as? String) ?? "?"
-            if email == currentAccount.email {
-                let saved = keychain.saveAccountBackup(token: currentToken, oauthAccount: currentOAuth, forAccountId: currentAccount.id.uuidString)
-                log.info("[switchAccount] Step 1: Backup saved: \(saved)")
-            } else {
-                log.warning("[switchAccount] Step 1: oauthAccount email (\(email)) != source (\(currentAccount.email)), skipping backup")
+        // Refuse a destructive write when the current credential cannot be
+        // read and restored. A denied backup write is not a successful backup.
+        guard let token = keychain.readClaudeToken(), let identity = keychain.readOAuthAccount() else {
+            throw ClaudeServiceError.currentCredentialsUnavailable
+        }
+        let previous = AccountBackup(token: token, oauthAccount: identity)
+        if let currentAccount,
+           identity["emailAddress"]?.value as? String == currentAccount.email {
+            guard keychain.saveAccountBackup(token: token, oauthAccount: identity,
+                                             forAccountId: currentAccount.id.uuidString) else {
+                throw ClaudeServiceError.backupWriteFailed
             }
-        } else {
-            log.warning("[switchAccount] Step 1: Could not read current token or oauthAccount")
         }
-
-        // 2. Target backup was resolved and validated by the caller.
-        log.info("[switchAccount] Step 2: Using caller-resolved backup for target account")
-
-        // 3. Write target token to keychain + target oauthAccount to ~/.claude.json
-        log.info("[switchAccount] Step 3: Writing target credentials...")
-        guard keychain.writeClaudeToken(targetBackup.token) else {
-            log.error("[switchAccount] Step 3: Failed to write token to keychain!")
-            throw ClaudeServiceError.keychainWriteFailed
+        return try await CredentialSwitchTransaction.run(previous: previous, target: targetBackup,
+                                                          writeToken: keychain.writeClaudeToken,
+                                                          writeIdentity: keychain.writeOAuthAccount) {
+            try await self.verifySwitch(to: targetAccount, backup: targetBackup)
         }
-        guard keychain.writeOAuthAccount(targetBackup.oauthAccount) else {
-            log.error("[switchAccount] Step 3: Failed to write oauthAccount to ~/.claude.json!")
-            throw ClaudeServiceError.oauthAccountWriteFailed
-        }
-        log.info("[switchAccount] Step 3: Both token and oauthAccount written")
+    }
 
+    @MainActor
+    private func verifySwitch(to targetAccount: Account, backup targetBackup: AccountBackup) async throws -> SwitchOutcome {
         // 4. Verify
         log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
         let status = try await getAuthStatus()
@@ -483,7 +441,7 @@ final class ClaudeService: @unchecked Sendable {
     }
 
     /// Capture the current Claude auth token + oauthAccount and associate with an account
-    func captureCurrentCredentials(forAccountId accountId: String) -> Bool {
+    func captureCurrentCredentials(forAccountId accountId: String, expectedEmail: String) -> Bool {
         log.info("[capture] Capturing credentials for account \(accountId)...")
         let keychain = KeychainService.shared
         guard let token = keychain.readClaudeToken() else {
@@ -494,7 +452,11 @@ final class ClaudeService: @unchecked Sendable {
             log.error("[capture] Failed: no oauthAccount found in ~/.claude.json")
             return false
         }
-        let email = (oauthAccount["emailAddress"]?.value as? String) ?? "?"
+        guard oauthAccount["emailAddress"]?.value as? String == expectedEmail else {
+            log.warning("[capture] Live identity changed; refusing to overwrite this account's backup")
+            return false
+        }
+        let email = expectedEmail
         log.info("[capture] Token + oauthAccount found (email=\(email)), saving backup...")
         let result = keychain.saveAccountBackup(token: token, oauthAccount: oauthAccount, forAccountId: accountId)
         log.info("[capture] Save result: \(result)")
@@ -504,7 +466,7 @@ final class ClaudeService: @unchecked Sendable {
     /// Run `claude auth login` which opens browser for OAuth.
     func login() async throws {
         log.info("[login] Starting `claude auth login`... (will open browser)")
-        _ = try await runClaude(args: ["auth", "login"])
+        _ = try await runClaude(args: ["auth", "login"], timeout: 300)
         log.info("[login] `claude auth login` process exited")
 
         // Give keychain a moment to sync after CLI writes
@@ -524,62 +486,11 @@ final class ClaudeService: @unchecked Sendable {
     /// Run `<path> --version` and return the first semver-looking token.
     /// Returns nil on launch failure, non-zero exit, or no version found.
     static func readVersion(at path: String) async -> String? {
-        guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                let stdout = Pipe()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = ["--version"]
-                process.standardOutput = stdout
-                process.standardError = Pipe()
-
-                // Inject same PATH augmentation as runClaude so NVM-installed
-                // claude can find `node` when invoked here.
-                var env = ProcessInfo.processInfo.environment
-                let homeDir = NSHomeDirectory()
-                var extraPaths = [
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "\(homeDir)/.local/bin",
-                    "\(homeDir)/.npm-global/bin"
-                ]
-                let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-                let resolvedBinDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
-                extraPaths.insert(resolvedBinDir, at: 0)
-                let existingPath = env["PATH"] ?? "/usr/bin:/bin"
-                env["PATH"] = (extraPaths + [existingPath]).joined(separator: ":")
-                env["HOME"] = homeDir
-                process.environment = env
-
-                do {
-                    try process.run()
-                } catch {
-                    log.warning("[readVersion] launch failed for \(path): \(error.localizedDescription)")
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let deadline = Date().addingTimeInterval(5.0)
-                while process.isRunning && Date() < deadline {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-                if process.isRunning {
-                    process.terminate()
-                    log.warning("[readVersion] timed out for \(path)")
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                guard process.terminationStatus == 0 else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let data = stdout.fileHandleForReading.readDataToEndOfFile()
-                let raw = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: Self.extractSemver(from: raw))
-            }
-        }
+        guard FileManager.default.isExecutableFile(atPath: path),
+              let result = try? await BoundedProcess.run(executable: path, arguments: ["--version"],
+                                                        environment: commandEnvironment(for: path), timeout: 5),
+              result.status == 0 else { return nil }
+        return extractSemver(from: result.stdout)
     }
 
     /// Fetch the latest published claude-code version. Returns nil on any failure.
@@ -590,7 +501,7 @@ final class ClaudeService: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5.0
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await Self.apiSession.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 log.warning("[fetchLatestVersion] non-200 response")
                 return nil
@@ -634,63 +545,30 @@ final class ClaudeService: @unchecked Sendable {
 
     // MARK: - CLI Runner
 
-    private func runClaude(args: [String]) async throws -> String {
-        let claudePath = self.claudePath
-        log.debug("[runClaude] Running: \(claudePath) \(args.joined(separator: " "))")
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [claudePath] in
-                let process = Process()
-                let pipe = Pipe()
-
-                process.executableURL = URL(fileURLWithPath: claudePath)
-                process.arguments = args
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                var env = ProcessInfo.processInfo.environment
-                let homeDir = NSHomeDirectory()
-                // Include the parent directory of the discovered claude binary
-                // so that `node` is on PATH for NVM-installed scripts.
-                // Only add it when claudePath is absolute (skip the bare "claude" fallback).
-                var extraPaths = [
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "\(homeDir)/.local/bin",
-                    "\(homeDir)/.npm-global/bin"
-                ]
-                if claudePath.contains("/") {
-                    // Resolve symlinks so that e.g. /usr/local/bin/claude -> ~/.nvm/.../bin/claude
-                    // yields the NVM bin dir where `node` actually lives
-                    let resolved = URL(fileURLWithPath: claudePath).resolvingSymlinksInPath().path
-                    let resolvedBinDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
-                    extraPaths.insert(resolvedBinDir, at: 0)
-                }
-                let existingPath = env["PATH"] ?? "/usr/bin:/bin"
-                env["PATH"] = (extraPaths + [existingPath]).joined(separator: ":")
-                env["HOME"] = homeDir
-                process.environment = env
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-
-                    if process.terminationStatus == 0 {
-                        log.debug("[runClaude] Success (exit 0), output length: \(output.count)")
-                        continuation.resume(returning: output)
-                    } else {
-                        log.error("[runClaude] Failed (exit \(process.terminationStatus))")
-                        continuation.resume(throwing: ClaudeServiceError.cliError("exit \(process.terminationStatus)"))
-                    }
-                } catch {
-                    log.error("[runClaude] Process launch failed: \(error.localizedDescription)")
-                    continuation.resume(throwing: ClaudeServiceError.processLaunchFailed(error))
-                }
-            }
+    private static func commandEnvironment(for path: String) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let directory = NSHomeDirectory()
+        var paths = ["/opt/homebrew/bin", "/usr/local/bin", "\(directory)/.local/bin", "\(directory)/.npm-global/bin"]
+        if path.hasPrefix("/") {
+            paths.insert(URL(fileURLWithPath: path).resolvingSymlinksInPath().deletingLastPathComponent().path, at: 0)
         }
+        environment["PATH"] = (paths + [environment["PATH"] ?? "/usr/bin:/bin"]).joined(separator: ":")
+        environment["HOME"] = directory
+        return environment
     }
+
+    private func runClaude(args: [String], timeout: TimeInterval = 15) async throws -> String {
+        let path = claudePath
+        let result = try await BoundedProcess.run(executable: path, arguments: args,
+                                                 environment: Self.commandEnvironment(for: path), timeout: timeout)
+        guard result.status == 0 else {
+            // Never include raw stdout/stderr in logs or errors: commands can
+            // print authentication details. Keep stderr out of auth-status JSON.
+            throw ClaudeServiceError.cliError("exit \(result.status)")
+        }
+        return result.stdout
+    }
+
 }
 
 // MARK: - Errors
@@ -700,6 +578,8 @@ enum ClaudeServiceError: LocalizedError {
     case cliError(String)
     case processLaunchFailed(Error)
     case noTokenForAccount(String)
+    case currentCredentialsUnavailable
+    case backupWriteFailed
     case keychainWriteFailed
     case oauthAccountWriteFailed
     case switchVerificationFailed
@@ -715,6 +595,10 @@ enum ClaudeServiceError: LocalizedError {
             return "Failed to launch Claude: \(error.localizedDescription)"
         case .noTokenForAccount:
             return "No stored backup for target account"
+        case .currentCredentialsUnavailable:
+            return "Cannot read the current credentials. Unlock the keychain or re-authenticate, then try again."
+        case .backupWriteFailed:
+            return "Could not back up the current account. No credentials were changed."
         case .keychainWriteFailed:
             return "Failed to write token to keychain"
         case .oauthAccountWriteFailed:
