@@ -105,7 +105,8 @@ private final class Harness {
         defaults.set(0.0, forKey: "localStatsInterval")
         defaults.set(autoSwitch, forKey: "autoSwitchEnabled")
         defaults.set(false, forKey: "useNearResetThreshold")
-        defaults.set(90.0, forKey: "autoSwitchThreshold")
+        defaults.set(90.0, forKey: "autoSwitchSessionThreshold")
+        defaults.set(99.0, forKey: "autoSwitchWeeklyThreshold")
         accounts = (0..<count).map {
             Account(id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", $0 + 1))!,
                     email: "account\($0)@example.test", displayName: "Account \($0)", isActive: $0 == 0)
@@ -133,9 +134,10 @@ private final class Harness {
         defaults.removePersistentDomain(forName: suite)
     }
     static func token(_ id: String) -> String { "{\"claudeAiOauth\":{\"accessToken\":\"\(id)\"}}" }
-    static func usage(_ percent: Double, weeklyReset: TimeInterval = 3 * 86400) -> UsageAPIResponse {
+    static func usage(_ percent: Double, weekly: Double = 10, weeklyReset: TimeInterval = 3 * 86400) -> UsageAPIResponse {
         let date = ISO8601DateFormatter().string(from: Date().addingTimeInterval(weeklyReset))
-        let json = "{\"five_hour\":{\"utilization\":\(percent),\"resets_at\":\"\(date)\"},\"seven_day\":{\"utilization\":10,\"resets_at\":\"\(date)\"}}"
+        let sessionReset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600))
+        let json = "{\"five_hour\":{\"utilization\":\(percent),\"resets_at\":\"\(sessionReset)\"},\"seven_day\":{\"utilization\":\(weekly),\"resets_at\":\"\(date)\"}}"
         return try! JSONDecoder().decode(UsageAPIResponse.self, from: Data(json.utf8))
     }
 }
@@ -416,5 +418,91 @@ final class AppStateTests: XCTestCase {
         await h.state.refresh()
         XCTAssertEqual(h.store.backups[h.accounts[1].id.uuidString]?.token, Harness.token("t1"))
         XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testNineHighWeeklyAccountsCanStillRotateAtSession90() async {
+        let h = Harness(count: 9, autoSwitch: true)
+        defer { h.cleanup() }
+        // An upgraded installation may still store 99 in the legacy shared
+        // setting. New independent defaults must be 90 session / 99 weekly.
+        h.defaults.removeObject(forKey: "autoSwitchSessionThreshold")
+        h.defaults.removeObject(forKey: "autoSwitchWeeklyThreshold")
+        h.defaults.set(99.0, forKey: "autoSwitchThreshold")
+        h.client.usage["t0"] = Harness.usage(90, weekly: 95)
+        for index in 1..<9 {
+            let reading = Harness.usage(0, weekly: 90 + Double(index), weeklyReset: Double(index + 2) * 86_400)
+            h.client.usage["t\(index)"] = reading
+            h.state.accountUsage[h.accounts[index].id] = reading
+        }
+        await h.state.refresh(allAccounts: true)
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[1].id)
+        XCTAssertEqual(h.state.accountUsage[h.accounts[1].id]?.sevenDay?.utilization, 91)
+    }
+
+    func testWeekly99TriggersWithAnEmptySessionBut98Point9DoesNot() async {
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(0, weekly: 98.9)
+        h.client.usage["t1"] = Harness.usage(0, weekly: 93)
+        await h.state.refresh(allAccounts: true)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        h.client.usage["t0"] = Harness.usage(0, weekly: 99)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+    }
+
+    func testFreshWeekly99RejectsCandidateDespiteCachedEmptySessionAndWeekly93() async {
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(90, weekly: 95)
+        h.client.usage["t1"] = Harness.usage(0, weekly: 99)
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0, weekly: 93)
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+    }
+
+    func testEitherSliderChangingDuringVerificationCancelsTheSwap() async {
+        for (key, value) in [("autoSwitchSessionThreshold", 95.0), ("autoSwitchWeeklyThreshold", 97.0)] {
+            let h = Harness(count: 2, autoSwitch: true)
+            defer { h.cleanup() }
+            h.client.usage["t0"] = Harness.usage(90, weekly: 95)
+            h.client.usage["t1"] = Harness.usage(0, weekly: 93)
+            h.state.accountUsage[h.accounts[1].id] = Harness.usage(0, weekly: 93)
+            h.client.onUsage = { token in
+                if token == "t1" { h.defaults.set(value, forKey: key) }
+                return h.client.usage[token]!
+            }
+            await h.state.refresh()
+            XCTAssertTrue(h.client.switches.isEmpty, key)
+        }
+    }
+
+    func testFreshSession90CanSwitchAgainWithinFiveMinuteCooldown() async {
+        let h = Harness(count: 3, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(90, weekly: 95)
+        h.client.usage["t1"] = Harness.usage(0, weekly: 93, weeklyReset: 3 * 86_400)
+        h.client.usage["t2"] = Harness.usage(0, weekly: 95, weeklyReset: 4 * 86_400)
+        h.state.accountUsage[h.accounts[1].id] = h.client.usage["t1"]
+        h.state.accountUsage[h.accounts[2].id] = h.client.usage["t2"]
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        h.client.usage["t1"] = Harness.usage(90, weekly: 93)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id, h.accounts[2].id])
+    }
+
+    func testCustomSessionAndWeeklySliderValuesDriveTheCoordinator() async {
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.defaults.set(75.0, forKey: "autoSwitchSessionThreshold")
+        h.defaults.set(95.0, forKey: "autoSwitchWeeklyThreshold")
+        h.client.usage["t0"] = Harness.usage(75, weekly: 93)
+        h.client.usage["t1"] = Harness.usage(0, weekly: 94)
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0, weekly: 94)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
     }
 }

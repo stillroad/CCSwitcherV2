@@ -22,12 +22,13 @@ final class AutoSwitchTests: XCTestCase {
 
     func ranked(activeUsage: UsageAPIResponse, first: UsageAPIResponse, second: UsageAPIResponse,
                 strategy: AutoSwitchEngine.Strategy = .soonestReset, nearReset: Bool = true,
-                fresh: Bool = true) -> [UUID] {
+                fresh: Bool = true, sessionThreshold: Double = 90, weeklyThreshold: Double = 99) -> [UUID] {
         AutoSwitchEngine.rankedTargets(
             active: active, candidates: [later, soon],
             usageByAccount: [active.id: activeUsage, soon.id: first, later.id: second],
             isSwitchable: { _ in true }, activeSampledThisCycle: fresh,
-            threshold: 90, hysteresisPct: 10, strategy: strategy, useNearResetThreshold: nearReset,
+            policy: .init(strategy: strategy, sessionThreshold: sessionThreshold, weeklyThreshold: weeklyThreshold,
+                          useNearResetThreshold: nearReset),
             asOf: now
         ).map(\.id)
     }
@@ -42,12 +43,12 @@ final class AutoSwitchTests: XCTestCase {
                               second: usage(10, 10, reset: 4 * 86_400), strategy: .mostRemaining), [later.id, soon.id])
     }
 
-    func testNearResetWaitsUntil99OnEitherWindow() {
-        for nearUsage in [usage(98.9, 20), usage(10, 98.9)] {
-            XCTAssertTrue(ranked(activeUsage: nearUsage, first: usage(10, 20), second: usage(20, 30)).isEmpty)
+    func testNearResetRaisesOnlyWeeklyThreshold() {
+        for nearUsage in [usage(89.9, 20), usage(10, 98.9)] {
+            XCTAssertTrue(ranked(activeUsage: nearUsage, first: usage(10, 20), second: usage(20, 30), weeklyThreshold: 90).isEmpty)
         }
-        for atLimit in [usage(99, 20), usage(10, 99), usage(100, 20)] {
-            XCTAssertFalse(ranked(activeUsage: atLimit, first: usage(10, 20), second: usage(20, 30)).isEmpty)
+        for atLimit in [usage(90, 20), usage(10, 99), usage(100, 20)] {
+            XCTAssertFalse(ranked(activeUsage: atLimit, first: usage(10, 20), second: usage(20, 30), weeklyThreshold: 90).isEmpty)
         }
     }
 
@@ -59,35 +60,43 @@ final class AutoSwitchTests: XCTestCase {
     }
 
     func test48HourBoundaryAndInvalidResetDates() {
-        let policy = AutoSwitchEngine.Policy(useNearResetThreshold: true)
-        XCTAssertEqual(policy.threshold(for: usage(90, 10, reset: 172_800), asOf: now), 99)
-        XCTAssertEqual(policy.threshold(for: usage(90, 10, reset: 172_801), asOf: now), 90)
+        let policy = AutoSwitchEngine.Policy(weeklyThreshold: 90, useNearResetThreshold: true)
+        XCTAssertEqual(policy.weeklyLimit(for: usage(90, 10, reset: 172_800), asOf: now), 99)
+        XCTAssertEqual(policy.weeklyLimit(for: usage(90, 10, reset: 172_801), asOf: now), 90)
+        XCTAssertEqual(policy.sessionLimit, 90)
         for reset in [nil, 0.0, -1.0] as [Double?] {
-            XCTAssertEqual(policy.threshold(for: usage(90, 10, reset: reset), asOf: now), 90)
+            XCTAssertEqual(policy.weeklyLimit(for: usage(90, 10, reset: reset), asOf: now), 90)
         }
         let malformed = UsageAPIResponse(fiveHour: nil, sevenDay: UsageWindow(utilization: 95, resetsAt: "bad-date"),
                                         sevenDayOauthApps: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
                                         sevenDayCowork: nil, iguanaNecktie: nil, extraUsage: nil)
-        XCTAssertEqual(policy.threshold(for: malformed, asOf: now), 90)
+        XCTAssertEqual(policy.weeklyLimit(for: malformed, asOf: now), 90)
     }
 
     func testNearResetOverrideCanBeDisabled() {
-        XCTAssertFalse(ranked(activeUsage: usage(90, 20), first: usage(10, 20),
-                              second: usage(20, 30), nearReset: false).isEmpty)
+        XCTAssertFalse(ranked(activeUsage: usage(10, 90), first: usage(10, 20),
+                              second: usage(20, 30), nearReset: false, weeklyThreshold: 90).isEmpty)
+        XCTAssertTrue(ranked(activeUsage: usage(10, 90), first: usage(10, 20),
+                             second: usage(20, 30), weeklyThreshold: 90).isEmpty)
     }
 
-    func testCanUse98PercentCandidateButNever99PercentCandidate() {
-        XCTAssertEqual(ranked(activeUsage: usage(99, 20), first: usage(98, 98), second: usage(10, 99)), [soon.id])
-        XCTAssertTrue(ranked(activeUsage: usage(99, 20), first: usage(98.1, 20), second: usage(20, 98.1)).isEmpty)
+    func testWeeklyCandidateCanBeBelow99WithoutDiscardingTheLastTenPercent() {
+        XCTAssertEqual(ranked(activeUsage: usage(90, 20), first: usage(0, 98.9), second: usage(0, 99)), [soon.id])
+        // The screenshot's 90–93% weekly readings are eligible even far from reset.
+        XCTAssertEqual(ranked(activeUsage: usage(90, 95, reset: 5 * 86_400),
+                              first: usage(0, 93, reset: 3 * 86_400),
+                              second: usage(0, 90, reset: 4 * 86_400)), [soon.id, later.id])
     }
 
     func testBothCandidateWindowsMustHaveHeadroom() {
         XCTAssertTrue(ranked(activeUsage: usage(99, 20), first: usage(100, 0), second: usage(0, 100)).isEmpty)
     }
 
-    func testNormalHysteresisStillRequiresTenPoints() {
-        XCTAssertEqual(ranked(activeUsage: usage(90, 20), first: usage(80, 20),
-                              second: usage(10, 81), nearReset: false), [soon.id])
+    func testTenPointCandidateMarginAppliesOnlyToSessions() {
+        XCTAssertEqual(ranked(activeUsage: usage(90, 20), first: usage(80, 95),
+                              second: usage(80.1, 20), nearReset: false), [soon.id])
+        XCTAssertEqual(ranked(activeUsage: usage(90, 20), first: usage(80, 98),
+                              second: usage(80.1, 20)), [soon.id])
     }
 
     func testUnknownWeeklyResetSortsLast() {
@@ -121,7 +130,7 @@ final class AutoSwitchTests: XCTestCase {
             active: active, candidates: [active, soon, otherProvider, noSample],
             usageByAccount: [active.id: usage(99, 20), soon.id: usage(10, 10), otherProvider.id: usage(0, 0)],
             isSwitchable: { $0.id != self.soon.id }, activeSampledThisCycle: true,
-            threshold: 90, hysteresisPct: 10, asOf: now
+            policy: .init(), asOf: now
         )
         XCTAssertTrue(ranked.isEmpty)
     }
@@ -138,12 +147,50 @@ final class AutoSwitchTests: XCTestCase {
 
     func testFreshEmergencyUsageBypassesCooldown() {
         XCTAssertFalse(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-10), cooldown: 300,
-                                                      activeUsage: usage(99, 20), activeSampleIsFresh: true, asOf: now))
+                                                      activeUsage: usage(99, 20), activeSampleIsFresh: true, policy: .init(), asOf: now))
         XCTAssertTrue(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-10), cooldown: 300,
-                                                     activeUsage: usage(99, 20), activeSampleIsFresh: false, asOf: now))
+                                                     activeUsage: usage(99, 20), activeSampleIsFresh: false, policy: .init(), asOf: now))
         XCTAssertTrue(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-10), cooldown: 300,
-                                                     activeUsage: usage(98, 20), activeSampleIsFresh: true, asOf: now))
+                                                     activeUsage: usage(89, 20), activeSampleIsFresh: true, policy: .init(), asOf: now))
         XCTAssertFalse(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-300), cooldown: 300,
-                                                      activeUsage: usage(90, 20), activeSampleIsFresh: true, asOf: now))
+                                                      activeUsage: usage(90, 20), activeSampleIsFresh: true, policy: .init(), asOf: now))
+    }
+
+    func testSessionAndWeeklyTriggersAreIndependentAtTheirExactBoundaries() {
+        let policy = AutoSwitchEngine.Policy()
+        XCTAssertFalse(policy.shouldSwitch(usage(89.9, 98.9), asOf: now))
+        XCTAssertTrue(policy.shouldSwitch(usage(90, 20), asOf: now))
+        XCTAssertTrue(policy.shouldSwitch(usage(0, 99), asOf: now))
+        let custom = AutoSwitchEngine.Policy(sessionThreshold: 75, weeklyThreshold: 95)
+        XCTAssertFalse(custom.shouldSwitch(usage(74.9, 94.9), asOf: now))
+        XCTAssertTrue(custom.shouldSwitch(usage(75, 20), asOf: now))
+        XCTAssertTrue(custom.shouldSwitch(usage(0, 95), asOf: now))
+        XCTAssertTrue(custom.canSelect(usage(0, 94.9), asOf: now))
+        XCTAssertFalse(custom.canSelect(usage(0, 95), asOf: now))
+    }
+
+    func testWeeklyThresholdStillAppliesWhenTheSessionHasReset() {
+        let policy = AutoSwitchEngine.Policy()
+        XCTAssertFalse(policy.canSelect(usage(100, 99, sessionReset: -1), asOf: now))
+        XCTAssertTrue(policy.canSelect(usage(100, 98, sessionReset: -1), asOf: now))
+        XCTAssertTrue(policy.shouldSwitch(usage(100, 99, sessionReset: -1), asOf: now))
+    }
+
+    func testFreshConfiguredThresholdBypassesCooldownBefore99Percent() {
+        for reading in [usage(90, 20), usage(0, 99)] {
+            XCTAssertFalse(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-10), cooldown: 300,
+                                                          activeUsage: reading, activeSampleIsFresh: true,
+                                                          policy: .init(), asOf: now))
+            XCTAssertTrue(AutoSwitchEngine.isCoolingDown(lastSwitch: now.addingTimeInterval(-10), cooldown: 300,
+                                                         activeUsage: reading, activeSampleIsFresh: false,
+                                                         policy: .init(), asOf: now))
+        }
+    }
+
+    func testInvalidConfiguredThresholdsAreClampedIndependently() {
+        XCTAssertEqual(AutoSwitchEngine.Policy(sessionThreshold: .nan).sessionLimit, 90)
+        XCTAssertEqual(AutoSwitchEngine.Policy(sessionThreshold: 100).sessionLimit, 99)
+        XCTAssertEqual(AutoSwitchEngine.Policy(weeklyThreshold: .infinity).weeklyLimit(for: nil, asOf: now), 99)
+        XCTAssertEqual(AutoSwitchEngine.Policy(weeklyThreshold: 10).weeklyLimit(for: nil, asOf: now), 50)
     }
 }

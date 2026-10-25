@@ -4,7 +4,7 @@ import Foundation
 ///
 /// When either monitored window reaches its threshold, rank eligible accounts
 /// by remaining quota or weekly reset time. AppState verifies proposals before
-/// changing credentials. The optional 48-hour rule raises both windows to 99%.
+/// changing credentials. The optional 48-hour rule raises only the weekly limit.
 enum AutoSwitchEngine {
 
     enum Strategy: String, CaseIterable {
@@ -14,9 +14,18 @@ enum AutoSwitchEngine {
 
     struct Policy: Equatable {
         var strategy: Strategy = .mostRemaining
-        var normalThreshold: Double = 90
+        var sessionThreshold: Double = 90
+        var weeklyThreshold: Double = 99
         var useNearResetThreshold = false
+        /// Session headroom prevents bouncing between nearly-full sessions.
+        /// Weekly eligibility uses its own limit without this extra margin.
         var hysteresis: Double = 10
+
+        var sessionLimit: Double { Self.clamp(sessionThreshold, fallback: 90) }
+
+        private static func clamp(_ value: Double, fallback: Double) -> Double {
+            value.isFinite ? min(99, max(50, value)) : fallback
+        }
 
         /// The 48-hour rule refers to the weekly all-model quota, not the
         /// five-hour session window. Past/unknown resets never enable it.
@@ -26,25 +35,50 @@ enum AutoSwitchEngine {
             return remaining > 0 && remaining <= 48 * 60 * 60
         }
 
-        func threshold(for usage: UsageAPIResponse?, asOf now: Date) -> Double {
-            isNearWeeklyReset(usage, asOf: now) ? 99 : min(99, max(50, normalThreshold))
+        func weeklyLimit(for usage: UsageAPIResponse?, asOf now: Date) -> Double {
+            isNearWeeklyReset(usage, asOf: now) ? 99 : Self.clamp(weeklyThreshold, fallback: 99)
         }
 
-        func candidateCeiling(for usage: UsageAPIResponse?, asOf now: Date) -> Double {
-            // Let near-reset accounts with 90–98% usage be used up too. Keeping
-            // the normal 10-point margin here would strand their last quota.
-            let margin = isNearWeeklyReset(usage, asOf: now) ? 1 : max(1, hysteresis)
-            return threshold(for: usage, asOf: now) - margin
+        /// Percentage points remaining until either independently configured
+        /// trigger. Expired windows cannot trigger a switch or faster polling.
+        func headroom(_ usage: UsageAPIResponse?, asOf now: Date,
+                      requireKnownWindow: Bool = false) -> Double? {
+            guard let usage else { return nil }
+            let session = AutoSwitchEngine.utilization(usage.fiveHour, asOf: now, requireKnownWindow: requireKnownWindow)
+            let weekly = AutoSwitchEngine.utilization(usage.sevenDay, asOf: now, requireKnownWindow: requireKnownWindow)
+            return [session.map { sessionLimit - $0 },
+                    weekly.map { weeklyLimit(for: usage, asOf: now) - $0 }]
+                .compactMap { $0 }.min()
+        }
+
+        func shouldSwitch(_ usage: UsageAPIResponse?, asOf now: Date,
+                          requireKnownWindow: Bool = false) -> Bool {
+            headroom(usage, asOf: now, requireKnownWindow: requireKnownWindow).map { $0 <= 0 } ?? false
+        }
+
+        func canSelect(_ usage: UsageAPIResponse?, asOf now: Date) -> Bool {
+            guard let usage else { return false }
+            let session = AutoSwitchEngine.utilization(usage.fiveHour, asOf: now)
+            let weekly = AutoSwitchEngine.utilization(usage.sevenDay, asOf: now)
+            guard session != nil || weekly != nil else { return false }
+            let sessionMargin = hysteresis.isFinite ? max(1, hysteresis) : 10
+            // A 93%-weekly account with an empty session is usable at 90/99.
+            // Applying the session's ten-point margin to weekly usage would
+            // wrongly exclude it. Weekly usage must simply remain below its limit.
+            return (session.map { $0 <= sessionLimit - sessionMargin } ?? true)
+                && (weekly.map { $0 < weeklyLimit(for: usage, asOf: now) } ?? true)
         }
     }
 
-    /// A deliberate switch gets a grace period, unless a FRESH sample says
-    /// the new account is already at 99%. Stale data must not bypass cooldown.
+    /// A fresh reading at either configured limit overrides the grace period.
+    /// Otherwise a fast session could hit 90% just after switching and be held
+    /// until 99% by the old cooldown rule. Stale data cannot bypass cooldown.
     static func isCoolingDown(lastSwitch: Date?, cooldown: TimeInterval,
                               activeUsage: UsageAPIResponse?, activeSampleIsFresh: Bool,
+                              policy: Policy,
                               asOf now: Date) -> Bool {
         guard let lastSwitch, now.timeIntervalSince(lastSwitch) < cooldown else { return false }
-        if activeSampleIsFresh, let utilization = bindingUtilization(activeUsage, asOf: now), utilization >= 99 {
+        if activeSampleIsFresh, policy.shouldSwitch(activeUsage, asOf: now) {
             return false
         }
         return true
@@ -76,15 +110,15 @@ enum AutoSwitchEngine {
     ) -> Double? {
         guard let usage else { return nil }
         return [usage.fiveHour, usage.sevenDay]
-            .compactMap { window -> Double? in
-                guard let window, let util = window.utilization,
-                      util.isFinite, util >= 0 else { return nil }
-                guard let resets = window.resetsAtDate else {
-                    return requireKnownWindow ? nil : util
-                }
-                return resets <= now ? nil : util
-            }
+            .compactMap { utilization($0, asOf: now, requireKnownWindow: requireKnownWindow) }
             .max()
+    }
+
+    private static func utilization(_ window: UsageWindow?, asOf now: Date,
+                                    requireKnownWindow: Bool = false) -> Double? {
+        guard let window, let value = window.utilization, value.isFinite, value >= 0 else { return nil }
+        guard let reset = window.resetsAtDate else { return requireKnownWindow ? nil : value }
+        return reset <= now ? nil : value
     }
 
     /// Rank the accounts worth switching to, best first (most headroom).
@@ -106,9 +140,7 @@ enum AutoSwitchEngine {
     ///     construction); only RETAINED readings need the strict expiry check,
     ///     because they are the ones that can describe a window that has since
     ///     reset.
-    ///   - threshold: switch when the active binding utilization is >= this (e.g. 90).
-    ///   - hysteresisPct: a candidate must sit at least this far below the threshold
-    ///     to be eligible (e.g. 10 -> candidate must be <= threshold - 10).
+    ///   - policy: independent session/weekly thresholds and selection strategy.
     ///   - now: injected clock, for window-expiry checks and testability.
     /// - Returns: eligible accounts ordered best-first; empty means stay put.
     static func rankedTargets(
@@ -117,22 +149,16 @@ enum AutoSwitchEngine {
         usageByAccount: [UUID: UsageAPIResponse],
         isSwitchable: (Account) -> Bool,
         activeSampledThisCycle: Bool,
-        threshold: Double,
-        hysteresisPct: Double,
-        strategy: Strategy = .mostRemaining,
-        useNearResetThreshold: Bool = false,
+        policy: Policy,
         asOf now: Date = Date()
     ) -> [Account] {
-        let policy = Policy(strategy: strategy, normalThreshold: threshold,
-                            useNearResetThreshold: useNearResetThreshold, hysteresis: hysteresisPct)
         // 1) Only act once the active account has reached the threshold on a
         //    window we watch. Unknown active usage -> do nothing (can't decide).
         //    The trigger to move the user off an account must never rest on a
         //    RETAINED reading whose expiry we cannot establish — but a reading
         //    this very cycle fetched is current whether or not the endpoint
         //    sent a parseable resets_at.
-        guard let activeUtil = bindingUtilization(usageByAccount[active.id], asOf: now, requireKnownWindow: !activeSampledThisCycle),
-              activeUtil >= policy.threshold(for: usageByAccount[active.id], asOf: now) else {
+        guard policy.shouldSwitch(usageByAccount[active.id], asOf: now, requireKnownWindow: !activeSampledThisCycle) else {
             return []
         }
 
@@ -147,13 +173,13 @@ enum AutoSwitchEngine {
                 let usage = usageByAccount[candidate.id]
                 guard candidate.id != active.id, candidate.provider == active.provider,
                       let util = bindingUtilization(usageByAccount[candidate.id], asOf: now),
-                      util <= policy.candidateCeiling(for: usage, asOf: now),
+                      policy.canSelect(usage, asOf: now),
                       isSwitchable(candidate) else { return nil }
                 let reset = usage?.sevenDay?.resetsAtDate
                 return (candidate, util, reset.flatMap { $0 > now ? $0 : nil } ?? .distantFuture)
             }
             .sorted {
-                if strategy == .soonestReset, $0.reset != $1.reset { return $0.reset < $1.reset }
+                if policy.strategy == .soonestReset, $0.reset != $1.reset { return $0.reset < $1.reset }
                 if $0.utilization != $1.utilization { return $0.utilization < $1.utilization }
                 return $0.account.id.uuidString < $1.account.id.uuidString
             }

@@ -10,7 +10,8 @@ enum PreviewSettings {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         UserDefaults.standard.set(true, forKey: "autoSwitchEnabled")
-        UserDefaults.standard.set(90.0, forKey: "autoSwitchThreshold")
+        UserDefaults.standard.set(90.0, forKey: "autoSwitchSessionThreshold")
+        UserDefaults.standard.set(99.0, forKey: "autoSwitchWeeklyThreshold")
         let state = AppState(restoringSavedState: false)
         let updater = UpdateChecker()
         let config = MenuBarConfig.shared

@@ -98,7 +98,8 @@ final class AppState: ObservableObject {
     private var autoSwitchPolicy: AutoSwitchEngine.Policy {
         AutoSwitchEngine.Policy(
             strategy: AutoSwitchEngine.Strategy(rawValue: defaults.string(forKey: "autoSwitchStrategy") ?? "") ?? .soonestReset,
-            normalThreshold: autoSwitchThreshold,
+            sessionThreshold: defaults.object(forKey: "autoSwitchSessionThreshold") as? Double ?? 90,
+            weeklyThreshold: defaults.object(forKey: "autoSwitchWeeklyThreshold") as? Double ?? 99,
             useNearResetThreshold: defaults.object(forKey: "useNearResetThreshold") as? Bool ?? true,
             hysteresis: autoSwitchHysteresis
         )
@@ -129,14 +130,8 @@ final class AppState: ObservableObject {
         defaults.bool(forKey: "autoSwitchEnabled")
     }
 
-    /// Utilization percentage at which we switch. Defaults to 90 when unset.
-    private var autoSwitchThreshold: Double {
-        let stored = defaults.double(forKey: "autoSwitchThreshold")
-        return stored == 0 ? 90 : stored
-    }
-
-    /// A candidate must sit at least this far below the threshold to be eligible,
-    /// so two accounts hovering at the line never ping-pong.
+    /// Session headroom for selecting a candidate. Weekly eligibility is checked
+    /// separately against its threshold, without subtracting this margin.
     private let autoSwitchHysteresis: Double = 10
 
     /// Minimum gap between two automatic switches, to avoid rapid flip-flopping.
@@ -269,10 +264,10 @@ final class AppState: ObservableObject {
         let time = now()
         guard autoSwitchEnabled, let active = activeAccount,
               RefreshPolicy.isDue(lastAttempt: lastIdentityAttempt, interval: 60, asOf: time),
-              let utilization = AutoSwitchEngine.bindingUtilization(accountUsage[active.id], asOf: time, requireKnownWindow: true),
-              utilization >= autoSwitchPolicy.threshold(for: accountUsage[active.id], asOf: time) else { return false }
+              autoSwitchPolicy.shouldSwitch(accountUsage[active.id], asOf: time, requireKnownWindow: true) else { return false }
         return !AutoSwitchEngine.isCoolingDown(lastSwitch: lastAutoSwitchAt, cooldown: autoSwitchCooldown,
-                                               activeUsage: accountUsage[active.id], activeSampleIsFresh: false, asOf: time)
+                                               activeUsage: accountUsage[active.id], activeSampleIsFresh: false,
+                                               policy: autoSwitchPolicy, asOf: time)
     }
 
     private func waitForUsageSpacing() async {
@@ -717,9 +712,10 @@ final class AppState: ObservableObject {
 
         let activeSampledThisCycle = RefreshPolicy.isFreshSample(accountUsageSampledAt[active.id],
                                                                  cycleStart: lastCycleStart, asOf: now())
+        let policy = autoSwitchPolicy
         if AutoSwitchEngine.isCoolingDown(lastSwitch: lastAutoSwitchAt, cooldown: autoSwitchCooldown,
                                           activeUsage: accountUsage[active.id], activeSampleIsFresh: activeSampledThisCycle,
-                                          asOf: now()) {
+                                          policy: policy, asOf: now()) {
             return
         }
 
@@ -730,17 +726,13 @@ final class AppState: ObservableObject {
                 && (usageRetryNotBefore[$0.id] ?? .distantPast) <= time
                 && (failedAutoSwitchVerifications[$0.id] ?? .distantPast).addingTimeInterval(60) <= time
         }
-        let policy = autoSwitchPolicy
         let ranked = AutoSwitchEngine.rankedTargets(
             active: active,
             candidates: candidates,
             usageByAccount: accountUsage,
             isSwitchable: { [unowned self] in self.isSwitchable($0) },
             activeSampledThisCycle: activeSampledThisCycle,
-            threshold: autoSwitchThreshold,
-            hysteresisPct: autoSwitchHysteresis,
-            strategy: policy.strategy,
-            useNearResetThreshold: policy.useNearResetThreshold,
+            policy: policy,
             asOf: now()
         )
         guard !ranked.isEmpty else { return }
@@ -748,8 +740,7 @@ final class AppState: ObservableObject {
         isEvaluatingAutoSwitch = true
         defer { isEvaluatingAutoSwitch = false }
 
-        let activeUtil = AutoSwitchEngine.bindingUtilization(accountUsage[active.id], asOf: now()) ?? -1
-        log.info("[autoSwitch] Active \(active.id) at \(String(format: "%.0f", activeUtil))% (threshold \(policy.threshold(for: accountUsage[active.id], asOf: now()))%, strategy \(policy.strategy.rawValue)); \(ranked.count) candidate(s)")
+        log.info("[autoSwitch] Active \(active.id) reached a limit (session threshold \(policy.sessionLimit)%, weekly threshold \(policy.weeklyLimit(for: accountUsage[active.id], asOf: now()))%, strategy \(policy.strategy.rawValue)); \(ranked.count) candidate(s)")
 
         // At most ONE fresh verification request per evaluation. Later ranked
         // candidates only qualify via samples this cycle already took.
@@ -771,8 +762,7 @@ final class AppState: ObservableObject {
                 continue
             }
 
-            guard let verifiedUtil = AutoSwitchEngine.bindingUtilization(usage, asOf: now()),
-                  verifiedUtil <= policy.candidateCeiling(for: usage, asOf: now()) else {
+            guard policy.canSelect(usage, asOf: now()) else {
                 failedAutoSwitchVerifications[target.id] = now()
                 log.info("[autoSwitch] Candidate \(target.id) failed verification (\(AutoSwitchEngine.bindingUtilization(usage, asOf: now()).map { String(format: "%.0f%%", $0) } ?? "no reading")); trying next")
                 continue
@@ -790,11 +780,10 @@ final class AppState: ObservableObject {
 
             // The active window may have reset while the network request was
             // in flight. Re-evaluate the trigger with the current clock.
-            guard let currentUtil = AutoSwitchEngine.bindingUtilization(accountUsage[active.id], asOf: now(), requireKnownWindow: !activeSampledThisCycle),
-                  currentUtil >= policy.threshold(for: accountUsage[active.id], asOf: now()) else { return }
+            guard policy.shouldSwitch(accountUsage[active.id], asOf: now(), requireKnownWindow: !activeSampledThisCycle) else { return }
             failedAutoSwitchVerifications[target.id] = nil
 
-            log.info("[autoSwitch] Switching to \(target.id), verified at \(String(format: "%.0f", verifiedUtil))%")
+            log.info("[autoSwitch] Switching to \(target.id), verified below both limits")
             lastAutoSwitchAt = now()
             // switchTo() calls refresh() -> evaluateAutoSwitch() again, but the
             // re-entrancy flag + the freshly-set cooldown make that a no-op.

@@ -37,8 +37,7 @@ enum RefreshPolicy {
     ) -> TimeInterval {
         let base = max(15, configured)
         guard autoSwitchEnabled,
-              let utilization = AutoSwitchEngine.bindingUtilization(usage, asOf: now) else { return base }
-        let headroom = policy.threshold(for: usage, asOf: now) - utilization
+              let headroom = policy.headroom(usage, asOf: now) else { return base }
         if headroom <= 2 { return min(base, 15) }
         if headroom <= 10 { return min(base, 60) }
         return base

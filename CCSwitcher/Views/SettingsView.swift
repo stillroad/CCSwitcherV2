@@ -11,7 +11,8 @@ struct SettingsView: View {
     @AppStorage("showInDock") private var showInDock = false
     @AppStorage("appLanguage") private var appLanguage = "auto"
     @AppStorage("autoSwitchEnabled") private var autoSwitchEnabled = false
-    @AppStorage("autoSwitchThreshold") private var autoSwitchThreshold = 90.0
+    @AppStorage("autoSwitchSessionThreshold") private var autoSwitchSessionThreshold = 90.0
+    @AppStorage("autoSwitchWeeklyThreshold") private var autoSwitchWeeklyThreshold = 99.0
     @AppStorage("inactiveRefreshInterval") private var inactiveRefreshInterval = RefreshPolicy.defaultInactiveInterval
     @AppStorage("localStatsInterval") private var localStatsInterval = 0.0
     @AppStorage("autoSwitchStrategy") private var autoSwitchStrategy = AutoSwitchEngine.Strategy.soonestReset.rawValue
@@ -85,19 +86,34 @@ struct SettingsView: View {
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text("Switch at")
+                            Text("5-hour session threshold")
                             Spacer()
-                            Text("\(Int(autoSwitchThreshold))%")
+                            Text("\(Int(autoSwitchSessionThreshold))%")
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $autoSwitchThreshold, in: 50...99, step: 1)
+                        Slider(value: $autoSwitchSessionThreshold, in: 50...99, step: 1)
+                            .accessibilityLabel("5-hour session threshold")
                     }
-                    Toggle("Use up to 99% in the last 48 hours before weekly reset", isOn: $useNearResetThreshold)
-                    Text("The threshold applies to both 5-hour and weekly usage. Eligible accounts with the earliest weekly reset go first in reset mode. Unknown reset times go last.")
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Weekly threshold")
+                            Spacer()
+                            Text("\(Int(autoSwitchWeeklyThreshold))%")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $autoSwitchWeeklyThreshold, in: 50...99, step: 1)
+                            .accessibilityLabel("Weekly threshold")
+                    }
+                    Text("Switch when either threshold is reached. At 90% session / 99% weekly, an account with an empty session and 93% weekly usage is still available.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Active checks speed up to 1 minute near the threshold, then 15 seconds in the final 2%. A 5-minute cooldown prevents repeated switches, unless fresh usage is already at 99%. Bursts can still use the remaining quota between checks.")
+                    Toggle("Raise weekly threshold to 99% in the final 48 hours", isOn: $useNearResetThreshold)
+                    Text("The 5-hour session threshold always applies. Reset mode prioritizes eligible accounts with the earliest weekly reset; unknown reset times go last.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Checks speed up to 1 minute within 10 points of either threshold, then 15 seconds within 2 points. A fresh reading at either threshold overrides the 5-minute switch cooldown. Usage can still rise between checks.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

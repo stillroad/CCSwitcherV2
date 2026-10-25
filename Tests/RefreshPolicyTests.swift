@@ -92,11 +92,15 @@ final class RefreshPolicyTests: XCTestCase {
         XCTAssertEqual(due(lastAttempt: now.addingTimeInterval(-5)), [active.id])
     }
 
-    func testActivePollingAcceleratesOnlyNearItsEffectiveThreshold() {
+    func testActivePollingUsesSeparateSessionAndWeeklyHeadroom() {
         let fixtures = AutoSwitchTests()
         let policy = AutoSwitchEngine.Policy(useNearResetThreshold: true)
-        for (percent, expected) in [(88.0, 300.0), (89, 60), (96.9, 60), (97, 15), (99, 15)] {
+        for (percent, expected) in [(79.0, 300.0), (80, 60), (87.9, 60), (88, 15), (90, 15)] {
             XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(percent, 10),
+                                                       autoSwitchEnabled: true, policy: policy, asOf: now), expected)
+        }
+        for (percent, expected) in [(88.0, 300.0), (89, 60), (96.9, 60), (97, 15), (99, 15)] {
+            XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(0, percent),
                                                        autoSwitchEnabled: true, policy: policy, asOf: now), expected)
         }
         XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(99, 10),

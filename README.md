@@ -21,7 +21,7 @@ Personal fork of [XueshiQiao/CCSwitcher](https://github.com/XueshiQiao/CCSwitche
 
 - Active usage keeps its own refresh interval and speeds up near the switching threshold.
 - Inactive accounts refresh hourly by default, one at a time; startup and the manual refresh button sample all accounts.
-- Auto-switch can prefer the soonest **weekly reset**, with a 99% threshold during the final 48 hours.
+- Separate switching sliders default to **90% for 5-hour sessions** and **99% for weekly usage**. Auto-switch can prefer the soonest **weekly reset**; the optional final-48-hour override affects only the weekly threshold.
 - Local cost/activity statistics run **only when requested** by default; daily calculation is optional. Scans are cancellable and stop after a one-minute budget, independently of usage checks and switching.
 - Upstream automatic updates are disabled in the personal build.
 
