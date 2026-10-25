@@ -26,21 +26,28 @@ enum RefreshPolicy {
         return sample >= cycleStart && now.timeIntervalSince(sample) <= 30 && sample <= now
     }
 
-    /// Tighten checks as the active account approaches its switching threshold.
-    /// This reduces overshoot; a polling client cannot reserve quota atomically.
-    static func activeInterval(
-        configured: TimeInterval,
-        usage: UsageAPIResponse?,
-        autoSwitchEnabled: Bool,
-        policy: AutoSwitchEngine.Policy,
-        asOf now: Date
-    ) -> TimeInterval {
-        let base = max(15, configured)
-        guard autoSwitchEnabled,
-              let headroom = policy.headroom(usage, asOf: now) else { return base }
-        if headroom <= 2 { return min(base, 15) }
-        if headroom <= 10 { return min(base, 60) }
-        return base
+    /// Usage never silently accelerates polling. Sustained fast polling can
+    /// exhaust the usage endpoint's own quota precisely when readings matter.
+    static func activeInterval(configured: TimeInterval) -> TimeInterval {
+        configured.isFinite ? max(15, configured) : 300
+    }
+
+    /// Schedule directly from the latest cycle/request, not on a separate
+    /// 15-second grid that rounds every request up to the following tick.
+    static func nextAutomaticRefresh(lastIdentityAttempt: Date?, lastUsageAttempt: Date?,
+                                     configured: TimeInterval, asOf now: Date) -> Date {
+        let anchor = [lastIdentityAttempt, lastUsageAttempt].compactMap { $0 }.max() ?? now
+        return max(now, anchor.addingTimeInterval(activeInterval(configured: configured)))
+    }
+
+    /// A zero/missing Retry-After is not permission to keep trying every minute.
+    /// Back off 5, 10, 20, then 30 minutes; longer settings/server delays win.
+    static func rateLimitDelay(consecutiveFailures: Int, configured: TimeInterval,
+                               retryAfter: TimeInterval?) -> TimeInterval {
+        let exponent = min(3, max(0, consecutiveFailures - 1))
+        let backoff = min(1800, 300 * pow(2, Double(exponent)))
+        let serverDelay = retryAfter.flatMap { $0.isFinite ? max(0, $0) : nil } ?? 0
+        return max(activeInterval(configured: configured), backoff, serverDelay)
     }
 
     /// At most one inactive account per automatic cycle, oldest attempt first.

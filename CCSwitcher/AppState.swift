@@ -77,6 +77,7 @@ final class AppState: ObservableObject {
 
     private let accountsKey = "com.ccswitcher.accounts"
     private var refreshTimer: Timer?
+    private var autoRefreshStarted = false
 
     // MARK: - Usage polling state
 
@@ -110,6 +111,7 @@ final class AppState: ObservableObject {
     /// minutes - so once an account is rate-limited, polling it again before the
     /// server-given deadline just burns more quota. Stale samples are kept meanwhile.
     private var usageRetryNotBefore: [UUID: Date] = [:]
+    private var consecutiveUsageRateLimits: [UUID: Int] = [:]
 
     /// When the current/most recent refresh cycle began. Auto-switch uses it to
     /// tell which usage samples were taken by THIS cycle (already fresh — no
@@ -140,6 +142,7 @@ final class AppState: ObservableObject {
     private var lastAutoSwitchAt: Date?
     private var isEvaluatingAutoSwitch = false
     private var failedAutoSwitchVerifications: [UUID: Date] = [:]
+    private var lastSwitchVerificationAttempt: [UUID: Date] = [:]
 
     // MARK: - Initialization
 
@@ -187,6 +190,7 @@ final class AppState: ObservableObject {
         defer {
             refreshCycleRunning = false
             isLoading = false
+            scheduleAutoRefresh()
         }
         errorMessage = nil
         guard await refreshIdentity() else { return }
@@ -209,7 +213,7 @@ final class AppState: ObservableObject {
             guard let account = accounts.first(where: { $0.id == target.id }) else { continue }
             // A candidate verification already performed in this sweep counts
             // as its refresh, including when it just became the active account.
-            if (accountUsageSampledAt[account.id] ?? .distantPast) >= started { continue }
+            if (usageLastAttempt[account.id] ?? .distantPast) >= started { continue }
             await fetchAccountUsage(account)
             await evaluateAutoSwitch()
         }
@@ -252,22 +256,9 @@ final class AppState: ObservableObject {
         let time = now()
         let id = activeAccount?.id
         guard id.map({ (usageRetryNotBefore[$0] ?? .distantPast) <= time }) ?? true else { return false }
-        let cadence = RefreshPolicy.activeInterval(
-            configured: configuredRefreshInterval, usage: id.flatMap { accountUsage[$0] },
-            autoSwitchEnabled: autoSwitchEnabled, policy: autoSwitchPolicy, asOf: time
-        )
+        let cadence = RefreshPolicy.activeInterval(configured: configuredRefreshInterval)
         return RefreshPolicy.isDue(lastAttempt: id == nil ? lastIdentityAttempt : id.flatMap { usageLastAttempt[$0] },
                                    interval: cadence, asOf: time)
-    }
-
-    private func shouldReconsiderSwitch() -> Bool {
-        let time = now()
-        guard autoSwitchEnabled, let active = activeAccount,
-              RefreshPolicy.isDue(lastAttempt: lastIdentityAttempt, interval: 60, asOf: time),
-              autoSwitchPolicy.shouldSwitch(accountUsage[active.id], asOf: time, requireKnownWindow: true) else { return false }
-        return !AutoSwitchEngine.isCoolingDown(lastSwitch: lastAutoSwitchAt, cooldown: autoSwitchCooldown,
-                                               activeUsage: accountUsage[active.id], activeSampleIsFresh: false,
-                                               policy: autoSwitchPolicy, asOf: time)
     }
 
     private func waitForUsageSpacing() async {
@@ -338,29 +329,45 @@ final class AppState: ObservableObject {
     func startAutoRefresh(interval: TimeInterval = 300) {
         guard !isPreview else { return }
         stopAutoRefresh()
-        configuredRefreshInterval = interval
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        configuredRefreshInterval = RefreshPolicy.activeInterval(configured: interval)
+        autoRefreshStarted = true
+        scheduleAutoRefresh()
+    }
+
+    /// Exposed internally so tests can exercise the real scheduler's deadline
+    /// after simulated CLI/network latency, without sleeping for five minutes.
+    var nextAutomaticRefreshDate: Date {
+        RefreshPolicy.nextAutomaticRefresh(lastIdentityAttempt: lastIdentityAttempt,
+            lastUsageAttempt: activeAccount.flatMap { usageLastAttempt[$0.id] },
+            configured: configuredRefreshInterval, asOf: now())
+    }
+
+    private func scheduleAutoRefresh(notBefore: Date? = nil) {
+        guard autoRefreshStarted else { return }
+        refreshTimer?.invalidate()
+        let deadline = max(nextAutomaticRefreshDate, notBefore ?? .distantPast,
+                           now().addingTimeInterval(0.1))
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.refreshCycleRunning, !self.isEvaluatingAutoSwitch,
-                      !self.isSwitching else { return }
-                // A parked active account must not suppress due inactive
-                // accounts, which may become the next switch candidate.
-                let time = self.now()
-                let inactiveDue = RefreshPolicy.usageTargets(
-                    accounts: self.accounts, activeID: self.activeAccount?.id,
-                    lastAttempt: self.usageLastAttempt, retryNotBefore: self.usageRetryNotBefore,
-                    inactiveInterval: self.inactiveRefreshInterval, refreshAll: false,
-                    usageByAccount: self.accountUsage, asOf: time
-                ).contains { $0.id != self.activeAccount?.id }
-                if self.activePollIsDue() || inactiveDue || self.shouldReconsiderSwitch() {
-                    await self.refresh(forceActive: false)
-                }
+                await self?.refreshAutomatically()
             }
         }
-        refreshTimer?.tolerance = 1
+        timer.tolerance = 1
+        refreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func refreshAutomatically() async {
+        guard !refreshCycleRunning, !isEvaluatingAutoSwitch, !isLoggingIn, !isSwitching else {
+            // A busy operation must not turn a past deadline into a rapid retry loop.
+            scheduleAutoRefresh(notBefore: now().addingTimeInterval(configuredRefreshInterval))
+            return
+        }
+        await refresh(forceActive: false)
     }
 
     func stopAutoRefresh() {
+        autoRefreshStarted = false
         refreshTimer?.invalidate()
         refreshTimer = nil
     }
@@ -589,8 +596,10 @@ final class AppState: ObservableObject {
         accountUsageSampledAt[account.id] = nil
         accountUsageErrors[account.id] = nil
         usageRetryNotBefore[account.id] = nil
+        consecutiveUsageRateLimits[account.id] = nil
         usageLastAttempt[account.id] = nil
         failedAutoSwitchVerifications[account.id] = nil
+        lastSwitchVerificationAttempt[account.id] = nil
         if activeAccount?.id == account.id { activeAccount = nil }
         shouldAutoCaptureAccount = false
         saveAccounts(refreshWidget: true)
@@ -695,8 +704,8 @@ final class AppState: ObservableObject {
         return true
     }
 
-    /// Evaluate whether the active account has reached the threshold and, if so,
-    /// switch to an eligible same-provider account using the selected policy.
+    /// Evaluate the configured thresholds and the near-limit rate-limit fallback,
+    /// then verify an eligible same-provider account using the selected policy.
     /// Called after every completed refresh. Safe to call repeatedly.
     ///
     /// Candidates are ranked from whatever samples we hold, then the chosen one
@@ -724,7 +733,7 @@ final class AppState: ObservableObject {
         let candidates = accounts.filter {
             $0.provider == active.provider && $0.id != active.id
                 && (usageRetryNotBefore[$0.id] ?? .distantPast) <= time
-                && (failedAutoSwitchVerifications[$0.id] ?? .distantPast).addingTimeInterval(60) <= time
+                && (failedAutoSwitchVerifications[$0.id] ?? .distantPast).addingTimeInterval(2 * configuredRefreshInterval) <= time
         }
         let ranked = AutoSwitchEngine.rankedTargets(
             active: active,
@@ -733,6 +742,7 @@ final class AppState: ObservableObject {
             isSwitchable: { [unowned self] in self.isSwitchable($0) },
             activeSampledThisCycle: activeSampledThisCycle,
             policy: policy,
+            activeUsageIsRateLimited: accountUsageErrors[active.id]?.isRateLimited == true,
             asOf: now()
         )
         guard !ranked.isEmpty else { return }
@@ -740,11 +750,16 @@ final class AppState: ObservableObject {
         isEvaluatingAutoSwitch = true
         defer { isEvaluatingAutoSwitch = false }
 
-        log.info("[autoSwitch] Active \(active.id) reached a limit (session threshold \(policy.sessionLimit)%, weekly threshold \(policy.weeklyLimit(for: accountUsage[active.id], asOf: now()))%, strategy \(policy.strategy.rawValue)); \(ranked.count) candidate(s)")
+        let reason = policy.shouldSwitch(accountUsage[active.id], asOf: now(), requireKnownWindow: !activeSampledThisCycle)
+            ? "reached a limit" : "has rate-limited usage checks near a limit; switching early"
+        log.info("[autoSwitch] Active \(active.id) \(reason) (session threshold \(policy.sessionLimit)%, weekly threshold \(policy.weeklyLimit(for: accountUsage[active.id], asOf: now()))%, strategy \(policy.strategy.rawValue)); \(ranked.count) candidate(s)")
 
         // At most ONE fresh verification request per evaluation. Later ranked
         // candidates only qualify via samples this cycle already took.
-        var freshRequestBudget = 1
+        // Reconsideration and inactive sweeps may evaluate several times. They
+        // must not issue extra candidate checks between configured refreshes.
+        var freshRequestBudget = RefreshPolicy.isDue(lastAttempt: lastSwitchVerificationAttempt[active.id],
+                                                      interval: configuredRefreshInterval, asOf: now()) ? 1 : 0
         for target in ranked {
             let usage: UsageAPIResponse?
             if RefreshPolicy.isFreshSample(accountUsageSampledAt[target.id], cycleStart: lastCycleStart, asOf: now()) {
@@ -752,11 +767,10 @@ final class AppState: ObservableObject {
                 usage = accountUsage[target.id]
             } else if freshRequestBudget > 0 {
                 freshRequestBudget -= 1
+                lastSwitchVerificationAttempt[active.id] = now()
                 usage = await fetchUsageNow(for: target)
                 if let usage {
-                    accountUsage[target.id] = usage
-                    accountUsageSampledAt[target.id] = now()
-                    accountUsageErrors[target.id] = nil
+                    recordUsage(usage, for: target)
                 }
             } else {
                 continue
@@ -780,7 +794,9 @@ final class AppState: ObservableObject {
 
             // The active window may have reset while the network request was
             // in flight. Re-evaluate the trigger with the current clock.
-            guard policy.shouldSwitch(accountUsage[active.id], asOf: now(), requireKnownWindow: !activeSampledThisCycle) else { return }
+            guard policy.shouldSwitch(accountUsage[active.id], asOf: now(), requireKnownWindow: !activeSampledThisCycle)
+                    || (accountUsageErrors[active.id]?.isRateLimited == true
+                        && policy.shouldSwitchAfterRateLimit(accountUsage[active.id], asOf: now())) else { return }
             failedAutoSwitchVerifications[target.id] = nil
 
             log.info("[autoSwitch] Switching to \(target.id), verified below both limits")
@@ -942,13 +958,28 @@ final class AppState: ObservableObject {
 
     // MARK: - Usage
 
-    /// Park an account until the server-given deadline (floor 60s — "Retry-After:
-    /// 0" burst rejections must still park; default 2min when no
-    /// Retry-After was sent). Every path that observes a 429 goes through here.
+    /// Retain the last reading, but make the monitoring failure visible even
+    /// when we have cached data. Every 429 path shares this progressive backoff.
     private func park(_ account: Account, retryAfter: TimeInterval?) {
-        let parkFor = max(retryAfter.flatMap { $0.isFinite ? $0 : nil } ?? 120, 60)
+        let failures = min(4, (consecutiveUsageRateLimits[account.id] ?? 0) + 1)
+        consecutiveUsageRateLimits[account.id] = failures
+        let parkFor = RefreshPolicy.rateLimitDelay(consecutiveFailures: failures,
+                                                   configured: configuredRefreshInterval, retryAfter: retryAfter)
         usageRetryNotBefore[account.id] = now().addingTimeInterval(parkFor)
+        accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: true,
+            message: accountUsage[account.id] == nil
+                ? "Usage checks are rate-limited. Retrying later."
+                : "Usage checks paused (rate limit). Showing the last reading.")
         log.warning("[fetchUsage] \(account.id) rate-limited; parked for \(String(format: "%.0f", parkFor))s")
+    }
+
+    private func recordUsage(_ usage: UsageAPIResponse, for account: Account) {
+        accountUsage[account.id] = usage
+        accountUsageSampledAt[account.id] = now()
+        accountUsageErrors[account.id] = nil
+        usageRetryNotBefore[account.id] = nil
+        consecutiveUsageRateLimits[account.id] = nil
+        failedAutoSwitchVerifications[account.id] = nil
     }
 
     /// Fetch usage, honouring a 429 by parking the account. The post-refresh
@@ -1074,9 +1105,7 @@ final class AppState: ObservableObject {
             // A rate limit parks this account immediately. Sleeping/retrying
             // here would delay active-account monitoring behind idle accounts.
             let usage = try await claudeService.getUsageLimits(accessToken: accessToken)
-            accountUsage[account.id] = usage
-            accountUsageSampledAt[account.id] = now()
-            accountUsageErrors[account.id] = nil
+            recordUsage(usage, for: account)
             log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
         } catch ClaudeService.UsageError.forbidden {
             // No active Pro/Max subscription on this account (e.g. the plan
@@ -1086,15 +1115,9 @@ final class AppState: ObservableObject {
             log.warning("[fetchUsage] \(account.email) forbidden (no active subscription?)")
             clearForbiddenUsage(for: account)
         } catch ClaudeService.UsageError.rateLimited(let retryAfter) {
-            // Rate-limited: park the account until the server-given deadline
-            // and keep the last known sample - a stale percentage carrying
-            // its "Updated Xm ago" label beats an error banner. The sample
-            // timestamp is deliberately NOT bumped, so the UI keeps telling
-            // the truth about how old the number is.
+            // Preserve the sample and its timestamp. The warning stays visible
+            // alongside it, and a known near-limit window can trigger failover.
             park(account, retryAfter: retryAfter)
-            if accountUsage[account.id] == nil {
-                accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: true, message: String(localized: "API Rate Limited. Try again later.", bundle: L10n.bundle))
-            }
         } catch ClaudeService.UsageError.expired {
             log.warning("[fetchUsage] Token expired for \(account.email)")
             if account.id == activeAccount?.id {
@@ -1109,9 +1132,7 @@ final class AppState: ObservableObject {
                     if let refreshedJSON = keychain.readClaudeToken(),
                        let refreshedToken = ClaudeService.extractAccessToken(from: refreshedJSON),
                        let usage = await usageRespectingParking(accessToken: refreshedToken, account: account) {
-                        accountUsage[account.id] = usage
-                        accountUsageSampledAt[account.id] = now()
-                        accountUsageErrors[account.id] = nil
+                        recordUsage(usage, for: account)
                         log.info("[fetchUsage] Recovered \(account.email) via delegated refresh.")
                     }
                 } catch {
@@ -1131,9 +1152,7 @@ final class AppState: ObservableObject {
                     log.info("[fetchUsage] Silently refreshed backup for \(account.email); retrying usage")
                     if let newToken = ClaudeService.extractAccessToken(from: refreshed),
                        let usage = await usageRespectingParking(accessToken: newToken, account: account) {
-                        accountUsage[account.id] = usage
-                        accountUsageSampledAt[account.id] = now()
-                        accountUsageErrors[account.id] = nil
+                        recordUsage(usage, for: account)
                         log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
                     }
                 case .grantRejected, .noBackup, .rotationLost:

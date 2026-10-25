@@ -209,7 +209,8 @@ struct UsageDashboardView: View {
                 usageBars(usage)
                 extraUsageRow(usage.extraUsage)
                 sampleAgeLabel(account)
-            } else if let errorState = appState.accountUsageErrors[account.id] {
+            }
+            if let errorState = appState.accountUsageErrors[account.id] {
                 HStack {
                     Image(systemName: errorState.isRateLimited ? "timer" : (errorState.isExpired ? "exclamationmark.triangle" : "xmark.circle"))
                         .foregroundStyle(errorState.isExpired ? .yellow : .red)
@@ -220,7 +221,7 @@ struct UsageDashboardView: View {
                     Spacer()
                 }
                 .padding(.top, 4)
-            } else {
+            } else if usage == nil {
                 // No sample yet (accounts are polled round-robin) - this is a
                 // waiting state, not an error. The old hardcoded "Token expired"
                 // text here made healthy accounts look broken.

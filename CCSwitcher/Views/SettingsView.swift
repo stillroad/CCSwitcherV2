@@ -68,7 +68,7 @@ struct SettingsView: View {
                     Text("3 hours").tag(10_800.0)
                     Text("6 hours").tag(21_600.0)
                 }
-                Text("Inactive accounts refresh one at a time when due. A fresh usage check is required before an automatic switch.")
+                Text("The active interval stays fixed near limits. Each cycle also checks one due inactive account. A fresh usage check is required before an automatic switch.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Refresh all account usage now") {
@@ -113,7 +113,7 @@ struct SettingsView: View {
                     Text("The 5-hour session threshold always applies. Reset mode prioritizes eligible accounts with the earliest weekly reset; unknown reset times go last.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Checks speed up to 1 minute within 10 points of either threshold, then 15 seconds within 2 points. A fresh reading at either threshold overrides the 5-minute switch cooldown. Usage can still rise between checks.")
+                    Text("If a usage check is rate-limited within 2 points of either threshold, switch early to a freshly checked account. Rejected checks wait at least 5 minutes before retrying, with longer waits after repeated failures. Usage can still rise between checks.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

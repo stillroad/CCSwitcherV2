@@ -40,7 +40,7 @@ enum AutoSwitchEngine {
         }
 
         /// Percentage points remaining until either independently configured
-        /// trigger. Expired windows cannot trigger a switch or faster polling.
+        /// trigger. Expired windows cannot trigger a switch.
         func headroom(_ usage: UsageAPIResponse?, asOf now: Date,
                       requireKnownWindow: Bool = false) -> Double? {
             guard let usage else { return nil }
@@ -54,6 +54,13 @@ enum AutoSwitchEngine {
         func shouldSwitch(_ usage: UsageAPIResponse?, asOf now: Date,
                           requireKnownWindow: Bool = false) -> Bool {
             headroom(usage, asOf: now, requireKnownWindow: requireKnownWindow).map { $0 <= 0 } ?? false
+        }
+
+        /// When a usage check is rejected, a near-limit retained reading is a
+        /// reason to leave early. Require a known, unexpired window: an old
+        /// percentage must never trigger this fallback after its quota resets.
+        func shouldSwitchAfterRateLimit(_ usage: UsageAPIResponse?, asOf now: Date) -> Bool {
+            headroom(usage, asOf: now, requireKnownWindow: true).map { $0 <= 2 } ?? false
         }
 
         func canSelect(_ usage: UsageAPIResponse?, asOf now: Date) -> Bool {
@@ -141,6 +148,8 @@ enum AutoSwitchEngine {
     ///     because they are the ones that can describe a window that has since
     ///     reset.
     ///   - policy: independent session/weekly thresholds and selection strategy.
+    ///   - activeUsageIsRateLimited: the latest active check was rejected;
+    ///     permits the near-limit fallback using a known, unexpired window.
     ///   - now: injected clock, for window-expiry checks and testability.
     /// - Returns: eligible accounts ordered best-first; empty means stay put.
     static func rankedTargets(
@@ -150,15 +159,17 @@ enum AutoSwitchEngine {
         isSwitchable: (Account) -> Bool,
         activeSampledThisCycle: Bool,
         policy: Policy,
+        activeUsageIsRateLimited: Bool = false,
         asOf now: Date = Date()
     ) -> [Account] {
-        // 1) Only act once the active account has reached the threshold on a
-        //    window we watch. Unknown active usage -> do nothing (can't decide).
+        // 1) Act at the threshold, or just before it if monitoring is rate-limited.
+        //    Unknown active usage -> do nothing (can't decide).
         //    The trigger to move the user off an account must never rest on a
         //    RETAINED reading whose expiry we cannot establish — but a reading
         //    this very cycle fetched is current whether or not the endpoint
         //    sent a parseable resets_at.
-        guard policy.shouldSwitch(usageByAccount[active.id], asOf: now, requireKnownWindow: !activeSampledThisCycle) else {
+        guard policy.shouldSwitch(usageByAccount[active.id], asOf: now, requireKnownWindow: !activeSampledThisCycle)
+                || (activeUsageIsRateLimited && policy.shouldSwitchAfterRateLimit(usageByAccount[active.id], asOf: now)) else {
             return []
         }
 

@@ -92,21 +92,30 @@ final class RefreshPolicyTests: XCTestCase {
         XCTAssertEqual(due(lastAttempt: now.addingTimeInterval(-5)), [active.id])
     }
 
-    func testActivePollingUsesSeparateSessionAndWeeklyHeadroom() {
-        let fixtures = AutoSwitchTests()
-        let policy = AutoSwitchEngine.Policy(useNearResetThreshold: true)
-        for (percent, expected) in [(79.0, 300.0), (80, 60), (87.9, 60), (88, 15), (90, 15)] {
-            XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(percent, 10),
-                                                       autoSwitchEnabled: true, policy: policy, asOf: now), expected)
+    func testRefreshDeadlineFollowsActualRequestWithoutRoundingToTimerGrid() {
+        let request = now.addingTimeInterval(0.35)
+        for interval in [15.0, 60, 300, 600] {
+            XCTAssertEqual(RefreshPolicy.nextAutomaticRefresh(lastIdentityAttempt: now, lastUsageAttempt: request,
+                                                               configured: interval, asOf: now.addingTimeInterval(1)),
+                           request.addingTimeInterval(interval))
         }
-        for (percent, expected) in [(88.0, 300.0), (89, 60), (96.9, 60), (97, 15), (99, 15)] {
-            XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(0, percent),
-                                                       autoSwitchEnabled: true, policy: policy, asOf: now), expected)
+        XCTAssertEqual(RefreshPolicy.nextAutomaticRefresh(lastIdentityAttempt: nil, lastUsageAttempt: nil,
+                                                           configured: 300, asOf: now), now.addingTimeInterval(300))
+        XCTAssertEqual(RefreshPolicy.nextAutomaticRefresh(lastIdentityAttempt: now.addingTimeInterval(-600),
+                                                           lastUsageAttempt: nil, configured: 300, asOf: now), now)
+    }
+
+    func testRateLimitBackoffProgressesAndNeverShortensServerOrUserInterval() {
+        for (failures, seconds) in [(1, 300.0), (2, 600), (3, 1200), (4, 1800), (100, 1800)] {
+            for retry in [nil, 0, -1, .nan] as [Double?] {
+                XCTAssertEqual(RefreshPolicy.rateLimitDelay(consecutiveFailures: failures,
+                                                            configured: 300, retryAfter: retry), seconds)
+            }
         }
-        XCTAssertEqual(RefreshPolicy.activeInterval(configured: 300, usage: fixtures.usage(99, 10),
-                                                   autoSwitchEnabled: false, policy: policy, asOf: now), 300)
-        XCTAssertEqual(RefreshPolicy.activeInterval(configured: 15, usage: fixtures.usage(20, 10),
-                                                   autoSwitchEnabled: true, policy: policy, asOf: now), 15)
+        XCTAssertEqual(RefreshPolicy.rateLimitDelay(consecutiveFailures: 1, configured: 600, retryAfter: 0), 600)
+        XCTAssertEqual(RefreshPolicy.rateLimitDelay(consecutiveFailures: 4, configured: 300, retryAfter: 7200), 7200)
+        XCTAssertEqual(RefreshPolicy.activeInterval(configured: .nan), 300)
+        XCTAssertEqual(RefreshPolicy.activeInterval(configured: -1), 15)
     }
 
     func testLocalStatisticsDailyCadenceAndManualOnlyOption() {

@@ -41,12 +41,14 @@ private final class FakeClaude: ClaudeAccountClient {
     var allowsCapture = true
     var failsSwitch = false
     var onUsage: ((String) async throws -> UsageAPIResponse)?
+    var onAuthStatus: (() async -> Void)?
     var onRotation: ((String) async -> ClaudeService.OAuthRefreshResult)?
 
     init(store: MemoryCredentials, email: String) { self.store = store; self.email = email }
     func isClaudeAvailable() async -> Bool { true }
     func getAuthStatus() async throws -> AuthStatus {
-        AuthStatus(loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", email: email,
+        await onAuthStatus?()
+        return AuthStatus(loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", email: email,
                    orgId: nil, orgName: nil, subscriptionType: "max")
     }
     func getUsageLimits(accessToken: String) async throws -> UsageAPIResponse {
@@ -128,7 +130,9 @@ private final class Harness {
 
     deinit { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
     func cleanup() {
+        state.stopAutoRefresh()
         client.onUsage = nil
+        client.onAuthStatus = nil
         client.onRotation = nil
         localStats.work = nil
         defaults.removePersistentDomain(forName: suite)
@@ -357,14 +361,14 @@ final class AppStateTests: XCTestCase {
         let h = Harness(count: 9, autoSwitch: true, clock: clock)
         defer { h.cleanup() }
         h.client.onUsage = { token in
-            clock.advance(12)
+            clock.advance(60)
             return Harness.usage(token == "t0" ? 97 : 100)
         }
         await h.state.refresh(allAccounts: true)
         // Eight slow inactive requests must not postpone active monitoring for
         // the whole sweep. No candidate is eligible in this fixture.
-        XCTAssertGreaterThanOrEqual(h.client.usageCalls.filter { $0 == "t0" }.count, 4)
-        XCTAssertEqual(Array(h.client.usageCalls.prefix(3)), ["t0", "t1", "t0"])
+        XCTAssertEqual(h.client.usageCalls.filter { $0 == "t0" }.count, 2)
+        XCTAssertEqual(Array(h.client.usageCalls.prefix(3)), ["t0", "t1", "t2"])
         XCTAssertTrue(h.client.switches.isEmpty)
     }
 
@@ -375,6 +379,185 @@ final class AppStateTests: XCTestCase {
         await h.state.refresh(forceActive: false)
         XCTAssertEqual(h.client.usageCalls.filter { $0 == "t0" }.count, 1)
         XCTAssertEqual(Set(h.client.usageCalls), Set(["t0", "t1", "t2"]))
+    }
+
+    func testFiveMinutePollingStaysFixedNearBothLimitsIncludingRequestLatency() async {
+        for reading in [Harness.usage(89), Harness.usage(20, weekly: 98), Harness.usage(100)] {
+            let clock = TestClock()
+            let h = Harness(count: 1, autoSwitch: true, clock: clock)
+            defer { h.cleanup() }
+            var requests: [Date] = []
+            h.client.onAuthStatus = { clock.advance(0.35) }
+            h.client.onUsage = { _ in
+                requests.append(clock.date)
+                clock.advance(0.5)
+                return reading
+            }
+            await h.state.refresh()
+            for _ in 0..<3 {
+                XCTAssertEqual(h.state.nextAutomaticRefreshDate, requests.last!.addingTimeInterval(300))
+                clock.date = h.state.nextAutomaticRefreshDate
+                await h.state.refreshAutomatically()
+            }
+            XCTAssertEqual(requests.count, 4)
+            for (previous, next) in zip(requests, requests.dropFirst()) {
+                XCTAssertGreaterThanOrEqual(next.timeIntervalSince(previous), 300)
+                XCTAssertLessThan(next.timeIntervalSince(previous), 301)
+            }
+        }
+    }
+
+    func testNearLimitRateLimitSwitchesOnlyAfterFreshCandidateVerification() async {
+        for reading in [Harness.usage(88), Harness.usage(20, weekly: 98)] {
+            let clock = TestClock()
+            let h = Harness(count: 2, autoSwitch: true, clock: clock)
+            defer { h.cleanup() }
+            h.client.usage["t0"] = reading
+            await h.state.refresh(allAccounts: true)
+            let originalSample = h.state.accountUsageSampledAt[h.accounts[0].id]
+            XCTAssertTrue(h.client.switches.isEmpty)
+            h.client.onUsage = { token in
+                if token == "t0" { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+                return Harness.usage(0, weekly: 93)
+            }
+            clock.advance(300)
+            await h.state.refreshAutomatically()
+            XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+            XCTAssertEqual(h.client.usageCalls, ["t0", "t1", "t0", "t1"])
+            XCTAssertEqual(h.state.accountUsageSampledAt[h.accounts[0].id], originalSample)
+            XCTAssertEqual(h.state.accountUsageErrors[h.accounts[0].id]?.isRateLimited, true)
+        }
+    }
+
+    func testRateLimitFallbackRejectsCandidateWhoseFreshWeeklyUsageIsExhausted() async {
+        let clock = TestClock()
+        let h = Harness(count: 2, autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(20, weekly: 98)
+        await h.state.refresh(allAccounts: true)
+        h.client.onUsage = { token in
+            if token == "t0" { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+            return Harness.usage(0, weekly: 100)
+        }
+        clock.advance(300)
+        await h.state.refreshAutomatically()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.client.usageCalls.filter { $0 == "t1" }.count, 2)
+    }
+
+    func testRateLimitFallbackDoesNotMoveHealthyOrUnknownAccountsOrIgnoreDisabledSetting() async {
+        for (reading, enabled) in [(Harness.usage(87, weekly: 96), true), (Harness.usage(89, weekly: 98), false)] {
+            let clock = TestClock()
+            let h = Harness(count: 2, autoSwitch: enabled, clock: clock)
+            defer { h.cleanup() }
+            h.client.usage["t0"] = reading
+            await h.state.refresh(allAccounts: true)
+            h.client.onUsage = { token in
+                if token == "t0" { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+                return Harness.usage(20)
+            }
+            clock.advance(300)
+            await h.state.refreshAutomatically()
+            XCTAssertTrue(h.client.switches.isEmpty)
+            XCTAssertEqual(h.client.usageCalls.filter { $0 == "t1" }.count, 1)
+        }
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.onUsage = { token in
+            if token == "t0" { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+            return Harness.usage(20)
+        }
+        await h.state.refresh(allAccounts: true)
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testRateLimitFallbackRechecksResetAfterCandidateRequest() async {
+        let clock = TestClock()
+        let h = Harness(count: 2, autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(20, weekly: 98, weeklyReset: 310)
+        await h.state.refresh(allAccounts: true)
+        h.client.onUsage = { token in
+            if token == "t0" { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+            clock.advance(20)
+            return Harness.usage(20)
+        }
+        clock.advance(300)
+        await h.state.refreshAutomatically()
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testRepeatedZeroRetryAfterUsesFiveThenTenMinutesAndSuccessClearsBackoff() async {
+        let clock = TestClock()
+        let h = Harness(count: 1, clock: clock)
+        defer { h.cleanup() }
+        var rejected = true
+        h.client.onUsage = { _ in
+            if rejected { throw ClaudeService.UsageError.rateLimited(retryAfter: 0) }
+            return Harness.usage(20)
+        }
+        await h.state.refresh()
+        for _ in 0..<4 {
+            clock.advance(60)
+            await h.state.refresh(allAccounts: true)
+        }
+        XCTAssertEqual(h.client.usageCalls.count, 1)
+        clock.advance(60)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls.count, 2)
+        clock.advance(300)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls.count, 2)
+        rejected = false
+        clock.advance(300)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls.count, 3)
+        XCTAssertNil(h.state.accountUsageErrors[h.accounts[0].id])
+        rejected = true
+        clock.advance(300)
+        await h.state.refresh()
+        clock.advance(300)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls.count, 5, "Success must reset the backoff to five minutes")
+    }
+
+    func testFailedVerificationIsNotRepeatedBySameSweepOrBetweenAutomaticCycles() async {
+        let clock = TestClock()
+        let h = Harness(count: 3, autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        await h.state.refresh(allAccounts: true)
+        h.client.usage["t0"] = Harness.usage(90)
+        h.client.onUsage = { token in
+            if token == "t1" { throw ClaudeService.UsageError.network("test unavailable") }
+            return h.client.usage[token]!
+        }
+        clock.advance(300)
+        await h.state.refresh(allAccounts: true)
+        XCTAssertEqual(h.client.usageCalls.filter { $0 == "t1" }.count, 2,
+                       "Failed verification counts as the sweep's attempt too")
+        // The sweep can use t2's fresh sample without another verification.
+        XCTAssertEqual(h.client.switches, [h.accounts[2].id])
+    }
+
+    func testFailedCandidateDoesNotCauseExtraVerificationRequestsAndNextCycleCanTryAnother() async {
+        let clock = TestClock()
+        let h = Harness(count: 3, autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        await h.state.refresh(allAccounts: true)
+        h.client.usage["t0"] = Harness.usage(90)
+        h.client.onUsage = { token in
+            if token == "t1" { throw ClaudeService.UsageError.network("test unavailable") }
+            return h.client.usage[token]!
+        }
+        clock.advance(300)
+        await h.state.refreshAutomatically()
+        let count = h.client.usageCalls.count
+        clock.advance(60)
+        await h.state.refresh(forceActive: false)
+        XCTAssertEqual(h.client.usageCalls.count, count)
+        clock.advance(240)
+        await h.state.refreshAutomatically()
+        XCTAssertEqual(h.client.switches, [h.accounts[2].id])
     }
 
     func testExternalLoginDoesNotAttributeLiveUsageToOldAccount() async {

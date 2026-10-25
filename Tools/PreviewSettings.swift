@@ -16,10 +16,27 @@ enum PreviewSettings {
         let updater = UpdateChecker()
         let config = MenuBarConfig.shared
         let statisticsPreview = CommandLine.arguments.contains("--local-stats")
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: statisticsPreview ? 380 : 560, height: statisticsPreview ? 440 : 620),
+        let rateLimitPreview = CommandLine.arguments.contains("--rate-limit")
+        let compactPreview = statisticsPreview || rateLimitPreview
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: compactPreview ? 380 : 560, height: compactPreview ? 440 : 620),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "CCSwitcher Personal — Settings Preview"
-        if statisticsPreview {
+        if rateLimitPreview {
+            let account = Account(email: "preview@example.test", displayName: "Preview account", isActive: true)
+            state.accounts = [account]
+            state.activeAccount = account
+            let reset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600))
+            state.accountUsage[account.id] = UsageAPIResponse(
+                fiveHour: UsageWindow(utilization: 28, resetsAt: reset),
+                sevenDay: UsageWindow(utilization: 98, resetsAt: reset),
+                sevenDayOauthApps: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
+                sevenDayCowork: nil, iguanaNecktie: nil, extraUsage: nil)
+            state.accountUsageSampledAt[account.id] = Date().addingTimeInterval(-300)
+            state.accountUsageErrors[account.id] = AppState.UsageErrorState(isExpired: false, isRateLimited: true,
+                message: "Usage checks paused (rate limit). Showing the last reading.")
+            window.contentView = NSHostingView(rootView: UsageDashboardView()
+                .environmentObject(state).environmentObject(config))
+        } else if statisticsPreview {
             state.isRefreshingLocalStats = true
             state.localStatsProgress = "Reading changed log 12 of 37…"
             let stopped = AppState(restoringSavedState: false)

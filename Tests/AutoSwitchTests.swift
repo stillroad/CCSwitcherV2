@@ -140,6 +140,24 @@ final class AutoSwitchTests: XCTestCase {
         XCTAssertNil(AutoSwitchEngine.bindingUtilization(usage(.infinity, -10), asOf: now))
     }
 
+    func testRateLimitFallbackRequiresKnownUnexpiredWindowWithinTwoPoints() {
+        let policy = AutoSwitchEngine.Policy()
+        XCTAssertTrue(policy.shouldSwitchAfterRateLimit(usage(88, 10), asOf: now))
+        XCTAssertTrue(policy.shouldSwitchAfterRateLimit(usage(10, 97), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(usage(87.9, 96.9), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(usage(99, 99, reset: -1, sessionReset: -1), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(usage(99, 99, reset: nil, sessionReset: nil), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(nil, asOf: now))
+    }
+
+    func testRateLimitFallbackUsesIndependentLimitsAndWeeklyOnlyOverride() {
+        let policy = AutoSwitchEngine.Policy(sessionThreshold: 75, weeklyThreshold: 90, useNearResetThreshold: true)
+        XCTAssertTrue(policy.shouldSwitchAfterRateLimit(usage(73, 10), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(usage(72.9, 96.9), asOf: now))
+        XCTAssertTrue(policy.shouldSwitchAfterRateLimit(usage(10, 88, reset: 3 * 86_400), asOf: now))
+        XCTAssertFalse(policy.shouldSwitchAfterRateLimit(usage(10, 88, reset: 86_400), asOf: now))
+    }
+
     func testDeterministicTieBreak() {
         let expected = [soon.id, later.id].sorted { $0.uuidString < $1.uuidString }
         XCTAssertEqual(ranked(activeUsage: usage(99, 20), first: usage(20, 20), second: usage(20, 20)), expected)
