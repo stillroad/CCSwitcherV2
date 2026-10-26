@@ -205,6 +205,11 @@ struct UsageDashboardView: View {
     private func accountUsageCard(account: Account, usage: UsageAPIResponse?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             accountHeader(account)
+            if account.isRotationPaused {
+                Text("Rotation paused · Manual switching available")
+                    .font(.caption)
+                    .foregroundStyle(.textSecondary)
+            }
             if let usage = usage {
                 usageBars(usage)
                 extraUsageRow(usage.extraUsage)
@@ -278,6 +283,8 @@ struct UsageDashboardView: View {
             if let sub = account.displaySubscriptionType {
                 Badge(text: sub, color: .brand)
             }
+            AccountRotationButton(account: account)
+                .labelStyle(.iconOnly)
         }
     }
 

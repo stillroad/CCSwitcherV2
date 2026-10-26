@@ -148,6 +148,83 @@ private final class Harness {
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    func testPauseAndResumePersistWithoutTouchingCredentialsOrPolling() throws {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        let tokens = h.store.backups.mapValues(\.token)
+        h.state.setAccountRotationPaused(h.accounts[0], paused: true)
+        let saved = try XCTUnwrap(h.defaults.data(forKey: "com.ccswitcher.accounts"))
+        let restored = try JSONDecoder().decode([Account].self, from: saved)
+        XCTAssertTrue(restored[0].isRotationPaused)
+        XCTAssertEqual(Array(restored.dropFirst()), Array(h.accounts.dropFirst()))
+        XCTAssertTrue(try XCTUnwrap(h.state.activeAccount).isRotationPaused)
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+
+        // The caller may hold the original unpaused value; resolve by ID.
+        h.state.setAccountRotationPaused(h.accounts[0], paused: false)
+        let resumedData = try XCTUnwrap(h.defaults.data(forKey: "com.ccswitcher.accounts"))
+        XCTAssertEqual(try JSONDecoder().decode([Account].self, from: resumedData), h.accounts)
+        XCTAssertFalse(try XCTUnwrap(h.state.activeAccount).isRotationPaused)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.client.loginCalls, 0)
+        XCTAssertEqual(h.client.captureCalls, 0)
+        XCTAssertTrue(h.store.deleted.isEmpty)
+        XCTAssertEqual(h.store.backups.mapValues(\.token), tokens)
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+    }
+
+    func testAllOtherAccountsPausedPreventsSwitchUntilResumed() async {
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(90)
+        h.state.setAccountRotationPaused(h.accounts[1], paused: true)
+        await h.state.refresh(allAccounts: true)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+        let requests = h.client.usageCalls.count
+        h.state.setAccountRotationPaused(h.accounts[1], paused: false)
+        XCTAssertEqual(h.client.usageCalls.count, requests)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+    }
+
+    func testPausedAccountCanBeSelectedManuallyAndStaysPausedAfterRefresh() async throws {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.state.setAccountRotationPaused(h.accounts[1], paused: true)
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[1].id)
+        XCTAssertTrue(try XCTUnwrap(h.state.activeAccount).isRotationPaused)
+        let saved = try XCTUnwrap(h.defaults.data(forKey: "com.ccswitcher.accounts"))
+        let restored = try JSONDecoder().decode([Account].self, from: saved)
+        XCTAssertTrue(restored[1].isRotationPaused)
+        XCTAssertTrue(restored[1].isActive)
+        XCTAssertEqual(h.store.backups.count, 3)
+    }
+
+    func testPausingCandidateDuringVerificationCancelsItsAutomaticSwap() async {
+        let h = Harness(count: 2, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.usage["t0"] = Harness.usage(90)
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(20)
+        var pausedDuringVerification = false
+        h.client.onUsage = { token in
+            if token == "t1" {
+                pausedDuringVerification = true
+                h.state.setAccountRotationPaused(h.accounts[1], paused: true)
+            }
+            return h.client.usage[token]!
+        }
+        await h.state.refresh()
+        XCTAssertTrue(pausedDuringVerification)
+        XCTAssertTrue(h.state.accounts[1].isRotationPaused)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+        XCTAssertEqual(h.client.usageCalls.filter { $0 == "t1" }.count, 1)
+    }
+
     func testLocalStatisticsDefaultToManualWithoutChangingUsagePolling() async {
         let h = Harness()
         defer { h.cleanup() }

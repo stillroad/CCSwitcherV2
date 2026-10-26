@@ -17,11 +17,30 @@ enum PreviewSettings {
         let config = MenuBarConfig.shared
         let statisticsPreview = CommandLine.arguments.contains("--local-stats")
         let rateLimitPreview = CommandLine.arguments.contains("--rate-limit")
+        let rotationPreview = CommandLine.arguments.contains("--rotation")
         let compactPreview = statisticsPreview || rateLimitPreview
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: compactPreview ? 380 : 560, height: compactPreview ? 440 : 620),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: rotationPreview ? 360 : (compactPreview ? 380 : 560), height: compactPreview ? 440 : 620),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "CCSwitcher Personal — Settings Preview"
-        if rateLimitPreview {
+        if rotationPreview {
+            let accounts = [
+                Account(email: "work@example.test", displayName: "Work", subscriptionType: "max", isActive: true),
+                Account(email: "reserved@example.test", displayName: "Reserved", subscriptionType: "max", isRotationPaused: true),
+                Account(email: "long.account.name@example.test", displayName: "Long account name", subscriptionType: "max")
+            ]
+            state.accounts = accounts
+            state.activeAccount = accounts[0]
+            let reset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600))
+            for account in accounts {
+                state.accountUsage[account.id] = UsageAPIResponse(
+                    fiveHour: UsageWindow(utilization: 28, resetsAt: reset),
+                    sevenDay: UsageWindow(utilization: 93, resetsAt: reset),
+                    sevenDayOauthApps: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
+                    sevenDayCowork: nil, iguanaNecktie: nil, extraUsage: nil)
+            }
+            window.contentView = NSHostingView(rootView: MainMenuView()
+                .environmentObject(state).environmentObject(updater).environmentObject(config))
+        } else if rateLimitPreview {
             let account = Account(email: "preview@example.test", displayName: "Preview account", isActive: true)
             state.accounts = [account]
             state.activeAccount = account

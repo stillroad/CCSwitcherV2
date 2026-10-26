@@ -1,6 +1,6 @@
 # Personal fork
 
-Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.4 (70).
+Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.5 (71).
 
 ## Why the CPU was high
 
@@ -25,6 +25,10 @@ The large in-memory parse cache is released when calculation finishes, fails or 
 - Menu-bar countdowns tick once a minute; account/configuration changes still update immediately through the existing observer. Unchanged account preferences are not rewritten every poll. Widget updates are coalesced to at most once a minute, except account switches; yesterday's local statistics display as unavailable.
 
 ## Automatic switching
+
+Use the pause button beside an account in **Usage** or **Accounts** to exclude it from automatic rotation. Paused accounts show **Rotation paused** and a resume button. Their sign-in and usage history stay available, and **Switch** still selects them manually without clearing the pause. Pausing the active account leaves its current session running; normal threshold switching can still move away from it. Resume makes it eligible again on the next normal evaluation, subject to the existing quota checks. If all alternatives are paused, automatic switching stays on the current account.
+
+The pause choice survives app restarts and is local to each Mac. Existing accounts remain in rotation on upgrade. Pausing during candidate verification cancels selection of that account; the button is briefly disabled once the credential swap itself has begun. Pausing and resuming issue no usage requests, and do not change the polling intervals.
 
 Settings → General → Auto-switch contains separate limits and a selection strategy:
 
@@ -92,7 +96,7 @@ The personal-build flag prevents Sparkle from being initialized even if the exis
 
 ## Validation
 
-The 2026-10-25 audit and regression suite passed **85 automated tests**. The Release app and widget compiled for both architectures, and the packaged app passed strict signature verification. Live OAuth swaps, Intel execution and registration on a second Mac were not exercised by the test suite.
+The 2026-10-26 regression suite passed **93 automated tests**. The Release app and widget compiled for both architectures, and the packaged app passed strict signature verification. Pause/resume controls were exercised in both tabs in the native preview at the real 360-point menu width. Live OAuth swaps, Intel execution and registration on a second Mac were not exercised by the test suite.
 
 `swift test` covers reset ordering, both threshold modes, exact 48-hour/99% boundaries, invalid and stale readings, provider isolation, cooldown exceptions, nine-account scheduling, server backoff, reset-triggered refreshes, fixed active polling, daily statistics scheduling and snapshot persistence. It also exercises the actual AppState orchestration with injected in-memory services: concurrent credential operations, a nine-account slow sweep, failed removal, changed external identity, backup write failure, stale candidate verification and long backoff. Subprocess tests use harmless local commands to cover pipe saturation, timeout, output limits and exit codes. Credential transaction tests inject write and verification failures. No test reads real credentials or contacts Claude. Test preference suites and files are isolated and cleaned up.
 
@@ -101,6 +105,8 @@ Statistics regression tests cover a 4 GB sparse file without loading it into mem
 Separate-threshold regressions cover nine accounts with high weekly usage and empty sessions, independent exact trigger boundaries, weekly candidate eligibility up to (but below) 99%, session headroom, weekly-only near-reset overrides, fixed polling near either threshold, and fresh-threshold cooldown bypass. Coordinator tests verify custom slider values, legacy shared-99% upgrades, rejection of a candidate whose fresh weekly usage reaches 99%, and cancellation of an in-flight decision when either slider changes.
 
 Version 1.12.4 regressions reproduce five-minute scheduling with request latency, near-limit active-account 429s, repeated zero Retry-After responses, progressive backoff and recovery, failed-verification request limits, fresh exhausted candidates, and a quota reset during fallback verification.
+
+Version 1.12.5 regressions cover loading older saved accounts without a pause field, pause persistence, both selection strategies and rate-limit fallback, manual use of a paused account, resuming automatic eligibility, all alternatives paused, switching away from a paused active account, and pausing during verification. The `--rotation` native preview uses synthetic accounts at the real menu width and allows testing pause/resume in both tabs without credentials or polling.
 
 `CCSwitcherPreview` is an isolated native settings preview target. It uses its own preferences domain and an empty AppState; it never starts account polling or restores credentials. The new controls were inspected in this preview. The Release application and widget are also compiled together.
 

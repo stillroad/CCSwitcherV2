@@ -123,7 +123,7 @@ final class AppState: ObservableObject {
     /// responsive, so without this a second switch — a user click during an
     /// auto-switch verification, or vice versa — could interleave keychain and
     /// ~/.claude.json writes with the first.
-    private var isSwitching = false
+    @Published private(set) var isSwitching = false
 
     // MARK: - Auto-switch
 
@@ -576,6 +576,18 @@ final class AppState: ObservableObject {
         log.info("[updateAccountLabel] Set label for \(account.email): \(trimmed ?? "nil")")
     }
 
+    /// Changes future automatic selection only. Pausing the active account
+    /// does not interrupt it, and manual switching never clears the pause.
+    func setAccountRotationPaused(_ account: Account, paused: Bool) {
+        guard !isSwitching,
+              let index = accounts.firstIndex(where: { $0.id == account.id }),
+              accounts[index].isRotationPaused != paused else { return }
+        accounts[index].isRotationPaused = paused
+        if activeAccount?.id == account.id { activeAccount = accounts[index] }
+        if !isPreview { saveAccounts() }
+        log.info("[rotation] Account \(account.id) paused=\(paused)")
+    }
+
     func removeAccount(_ account: Account) async {
         guard !isPreview else { return }
         guard !isRefreshing, !isSwitching, !isLoggingIn, !isEvaluatingAutoSwitch else { return }
@@ -731,7 +743,7 @@ final class AppState: ObservableObject {
         // Only consider same-provider accounts (a Claude switch never touches Codex/Gemini).
         let time = now()
         let candidates = accounts.filter {
-            $0.provider == active.provider && $0.id != active.id
+            $0.provider == active.provider && $0.id != active.id && !$0.isRotationPaused
                 && (usageRetryNotBefore[$0.id] ?? .distantPast) <= time
                 && (failedAutoSwitchVerifications[$0.id] ?? .distantPast).addingTimeInterval(2 * configuredRefreshInterval) <= time
         }
@@ -761,6 +773,8 @@ final class AppState: ObservableObject {
         var freshRequestBudget = RefreshPolicy.isDue(lastAttempt: lastSwitchVerificationAttempt[active.id],
                                                       interval: configuredRefreshInterval, asOf: now()) ? 1 : 0
         for target in ranked {
+            // A previous candidate's network request can yield to a pause click.
+            guard accounts.contains(where: { $0.id == target.id && !$0.isRotationPaused }) else { continue }
             let usage: UsageAPIResponse?
             if RefreshPolicy.isFreshSample(accountUsageSampledAt[target.id], cycleStart: lastCycleStart, asOf: now()) {
                 // Sampled by this very cycle — that IS a fresh reading.
@@ -791,6 +805,9 @@ final class AppState: ObservableObject {
                 log.info("[autoSwitch] State changed during verification; standing down")
                 return
             }
+            // The user may have paused this very candidate during verification.
+            // Read the current account, not the ranked snapshot from before the await.
+            guard accounts.contains(where: { $0.id == target.id && !$0.isRotationPaused }) else { continue }
 
             // The active window may have reset while the network request was
             // in flight. Re-evaluate the trigger with the current clock.

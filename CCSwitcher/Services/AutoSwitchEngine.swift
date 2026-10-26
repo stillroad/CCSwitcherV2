@@ -182,7 +182,7 @@ enum AutoSwitchEngine {
         return candidates
             .compactMap { candidate -> (account: Account, utilization: Double, reset: Date)? in
                 let usage = usageByAccount[candidate.id]
-                guard candidate.id != active.id, candidate.provider == active.provider,
+                guard candidate.id != active.id, candidate.provider == active.provider, !candidate.isRotationPaused,
                       let util = bindingUtilization(usageByAccount[candidate.id], asOf: now),
                       policy.canSelect(usage, asOf: now),
                       isSwitchable(candidate) else { return nil }

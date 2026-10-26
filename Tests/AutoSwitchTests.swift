@@ -135,6 +135,32 @@ final class AutoSwitchTests: XCTestCase {
         XCTAssertTrue(ranked.isEmpty)
     }
 
+    func testPausedAccountsAreExcludedByBothStrategiesAndRateLimitFallback() {
+        var paused = soon
+        paused.isRotationPaused = true
+        for strategy in [AutoSwitchEngine.Strategy.mostRemaining, .soonestReset] {
+            for rateLimited in [false, true] {
+                let targets = AutoSwitchEngine.rankedTargets(
+                    active: active, candidates: [paused, later],
+                    usageByAccount: [active.id: usage(rateLimited ? 88 : 90, 10),
+                                     paused.id: usage(0, 0), later.id: usage(30, 50, reset: 3 * 86_400)],
+                    isSwitchable: { _ in true }, activeSampledThisCycle: !rateLimited,
+                    policy: .init(strategy: strategy), activeUsageIsRateLimited: rateLimited, asOf: now)
+                XCTAssertEqual(targets.map(\.id), [later.id])
+            }
+        }
+    }
+
+    func testPausingActiveAccountStillAllowsAutomaticSwitchingAway() {
+        var pausedActive = active
+        pausedActive.isRotationPaused = true
+        let targets = AutoSwitchEngine.rankedTargets(
+            active: pausedActive, candidates: [soon],
+            usageByAccount: [active.id: usage(90, 10), soon.id: usage(0, 20)],
+            isSwitchable: { _ in true }, activeSampledThisCycle: true, policy: .init(), asOf: now)
+        XCTAssertEqual(targets.map(\.id), [soon.id])
+    }
+
     func testMalformedUtilizationDoesNotBecomeAnEmptyAccount() {
         XCTAssertNil(AutoSwitchEngine.bindingUtilization(usage(.nan, -1), asOf: now))
         XCTAssertNil(AutoSwitchEngine.bindingUtilization(usage(.infinity, -10), asOf: now))

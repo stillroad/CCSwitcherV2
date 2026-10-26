@@ -55,107 +55,121 @@ struct AccountSwitcherView: View {
     // MARK: - Account Row
 
     private func accountRow(_ account: Account) -> some View {
-        HStack(spacing: 12) {
-            // Provider icon
-            Image(systemName: account.provider.iconName)
-                .font(.title2)
-                .foregroundStyle(account.isActive ? .brand : .secondary)
-                .frame(width: 32, height: 32)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                // Provider icon
+                Image(systemName: account.provider.iconName)
+                    .font(.title2)
+                    .foregroundStyle(account.isActive ? .brand : .secondary)
+                    .frame(width: 32, height: 32)
 
-            // Account info
-            VStack(alignment: .leading, spacing: 2) {
-                if editingAccountId == account.id {
-                    HStack(spacing: 4) {
-                        TextField("Custom label", text: $editingLabel)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.subheadline)
-                            .onSubmit { commitLabelEdit(account) }
+                // Account info
+                VStack(alignment: .leading, spacing: 2) {
+                    if editingAccountId == account.id {
+                        HStack(spacing: 4) {
+                            TextField("Custom label", text: $editingLabel)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.subheadline)
+                                .onSubmit { commitLabelEdit(account) }
 
-                        Button {
-                            commitLabelEdit(account)
-                        } label: {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
+                            Button {
+                                commitLabelEdit(account)
+                            } label: {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                editingAccountId = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.textSecondary)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                    } else {
+                        HStack(spacing: 6) {
+                            Text(account.effectiveDisplayName(obfuscated: !showFullEmail))
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
 
-                        Button {
-                            editingAccountId = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.textSecondary)
+                            Button {
+                                editingLabel = account.customLabel ?? ""
+                                editingAccountId = account.id
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .font(.caption2)
+                                    .foregroundStyle(.textSecondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Edit label")
                         }
-                        .buttonStyle(.plain)
                     }
-                } else {
-                    HStack(spacing: 6) {
-                        Text(account.effectiveDisplayName(obfuscated: !showFullEmail))
-                            .font(.subheadline.weight(.medium))
 
-                        Button {
-                            editingLabel = account.customLabel ?? ""
-                            editingAccountId = account.id
-                        } label: {
-                            Image(systemName: "pencil")
+                    Text(account.displayEmail(obfuscated: !showFullEmail))
+                        .font(.caption)
+                        .foregroundStyle(.textSecondary)
+                        .lineLimit(1)
+
+                    HStack(spacing: 8) {
+                        if let sub = account.displaySubscriptionType {
+                            Label(sub, systemImage: "creditcard")
                                 .font(.caption2)
                                 .foregroundStyle(.textSecondary)
                         }
-                        .buttonStyle(.plain)
-                        .help("Edit label")
-
-                        if account.isActive {
-                            Badge(text: String(localized: "Active", bundle: L10n.bundle), color: .green)
-                        }
-                    }
-                }
-
-                Text(account.displayEmail(obfuscated: !showFullEmail))
-                    .font(.caption)
-                    .foregroundStyle(.textSecondary)
-
-                HStack(spacing: 8) {
-                    if let sub = account.displaySubscriptionType {
-                        Label(sub, systemImage: "creditcard")
+                        Text(account.provider.rawValue)
                             .font(.caption2)
                             .foregroundStyle(.textSecondary)
                     }
-                    Text(account.provider.rawValue)
-                        .font(.caption2)
-                        .foregroundStyle(.textSecondary)
+                }
+
+                Spacer(minLength: 0)
+                if account.isActive {
+                    Badge(text: String(localized: "Active", bundle: L10n.bundle), color: .green)
                 }
             }
 
-            Spacer()
+            if account.isRotationPaused {
+                Text("Rotation paused · Manual switching available")
+                    .font(.caption)
+                    .foregroundStyle(.textSecondary)
+            }
 
             // Actions
-            if !account.isActive {
-                Button("Switch") {
-                    Task { await appState.switchTo(account) }
+            HStack(spacing: 12) {
+                AccountRotationButton(account: account)
+                    .labelStyle(.titleAndIcon)
+                Spacer(minLength: 0)
+                if !account.isActive {
+                    Button("Switch") {
+                        Task { await appState.switchTo(account) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.brand)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(.brand)
-            }
 
-            Button {
-                Task { await appState.reauthenticateAccount(account) }
-            } label: {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-            .buttonStyle(.plain)
-            .help("Re-authenticate (fix stale token)")
+                Button {
+                    Task { await appState.reauthenticateAccount(account) }
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                .buttonStyle(.plain)
+                .help("Re-authenticate (fix stale token)")
 
-            Button {
-                Task { await appState.removeAccount(account) }
-            } label: {
-                Image(systemName: "trash")
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                Button {
+                    Task { await appState.removeAccount(account) }
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Remove account")
             }
-            .buttonStyle(.plain)
-            .help("Remove account")
         }
         .padding(12)
         .background(

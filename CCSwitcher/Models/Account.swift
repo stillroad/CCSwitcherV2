@@ -38,6 +38,8 @@ struct Account: Identifiable, Codable, Hashable {
     var isActive: Bool
     var lastUsed: Date?
     var customLabel: String?
+    /// Excluded from automatic selection; credentials and manual switching remain available.
+    var isRotationPaused: Bool
 
     /// Subscription type with first letter capitalized (e.g., "max" → "Max").
     var displaySubscriptionType: String? {
@@ -90,7 +92,8 @@ struct Account: Identifiable, Codable, Hashable {
         subscriptionType: String? = nil,
         isActive: Bool = false,
         lastUsed: Date? = nil,
-        customLabel: String? = nil
+        customLabel: String? = nil,
+        isRotationPaused: Bool = false
     ) {
         self.id = id
         self.email = email
@@ -101,6 +104,28 @@ struct Account: Identifiable, Codable, Hashable {
         self.isActive = isActive
         self.lastUsed = lastUsed
         self.customLabel = customLabel
+        self.isRotationPaused = isRotationPaused
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, email, displayName, provider, orgName, subscriptionType
+        case isActive, lastUsed, customLabel, isRotationPaused
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        email = try values.decode(String.self, forKey: .email)
+        displayName = try values.decode(String.self, forKey: .displayName)
+        provider = try values.decode(AIProviderType.self, forKey: .provider)
+        orgName = try values.decodeIfPresent(String.self, forKey: .orgName)
+        subscriptionType = try values.decodeIfPresent(String.self, forKey: .subscriptionType)
+        isActive = try values.decode(Bool.self, forKey: .isActive)
+        lastUsed = try values.decodeIfPresent(Date.self, forKey: .lastUsed)
+        customLabel = try values.decodeIfPresent(String.self, forKey: .customLabel)
+        // Existing installations have no pause flag. Never lose their saved
+        // account list or silently remove them from rotation during an upgrade.
+        isRotationPaused = try values.decodeIfPresent(Bool.self, forKey: .isRotationPaused) ?? false
     }
 }
 
