@@ -136,6 +136,8 @@ struct AccountSwitcherView: View {
                     .foregroundStyle(.textSecondary)
             }
 
+            AccountAuthStatusView(account: account)
+
             // Actions
             HStack(spacing: 12) {
                 AccountRotationButton(account: account)
@@ -148,6 +150,7 @@ struct AccountSwitcherView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .tint(.brand)
+                    .disabled(appState.accountAuthHealth[account.id]?.needsReauthentication == true)
                 }
 
                 Button {

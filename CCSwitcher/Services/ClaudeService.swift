@@ -259,12 +259,13 @@ final class ClaudeService: @unchecked Sendable {
         case rejected
         /// Network trouble or a server-side error; the token's validity is unknown.
         case transient
+        case rateLimited(TimeInterval?)
     }
 
     /// Silently refresh a credential JSON using its refresh token, via a direct
-    /// POST to the OAuth token endpoint. Never touches the keychain - safe to run
-    /// for non-active accounts while Claude Code sessions are working, because
-    /// only CCSwitcher holds these backups (rotation cannot race anyone).
+    /// POST to the OAuth token endpoint. Never touches the live keychain. The
+    /// caller serializes backup renewal; external clients can still hold a
+    /// cached credential, so this is not a cross-process lock.
     func refreshOAuthCredentials(_ credentialsJSON: String) async -> OAuthRefreshResult {
         guard var root = (try? JSONSerialization.jsonObject(with: Data(credentialsJSON.utf8))) as? [String: Any],
               var oauth = root["claudeAiOauth"] as? [String: Any],
@@ -289,8 +290,9 @@ final class ClaudeService: @unchecked Sendable {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200,
                   let resp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let accessToken = resp["access_token"] as? String,
-                  let expiresIn = resp["expires_in"] as? Double
+                  let accessToken = resp["access_token"] as? String, !accessToken.isEmpty,
+                  let expiresIn = resp["expires_in"] as? Double, expiresIn.isFinite,
+                  expiresIn > 0, expiresIn < 10 * 365 * 86400
             else {
                 // NEVER log the response body. This guard also fires when the
                 // status IS 200 but a field failed to parse (schema change) —
@@ -311,6 +313,9 @@ final class ClaudeService: @unchecked Sendable {
                 // mismatch — says nothing about the token, and demanding
                 // re-authentication for it would be a pointless login.
                 if status == 200 { return .transient }
+                if status == 429 {
+                    return .rateLimited(RefreshPolicy.retryAfter((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"), asOf: Date()))
+                }
                 return oauthError == "invalid_grant" ? .rejected : .transient
             }
 
@@ -339,13 +344,7 @@ final class ClaudeService: @unchecked Sendable {
 
     /// Extract access token string from a token JSON (keychain format)
     static func extractAccessToken(from tokenJSON: String) -> String? {
-        guard let data = tokenJSON.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let accessToken = oauth["accessToken"] as? String else {
-            return nil
-        }
-        return accessToken
+        OAuthCredential(tokenJSON)?.accessToken
     }
 
     // MARK: - Account Switching
@@ -363,6 +362,11 @@ final class ClaudeService: @unchecked Sendable {
     @MainActor @discardableResult
     func switchAccount(from currentAccount: Account?, to targetAccount: Account, targetBackup: AccountBackup) async throws -> SwitchOutcome {
         let keychain = KeychainService.shared
+        guard let destination = OAuthCredential(targetBackup.token), destination.isComplete,
+              !destination.needsRenewal(asOf: Date(), margin: 60),
+              targetBackup.oauthAccount["emailAddress"]?.value as? String == targetAccount.email else {
+            throw ClaudeServiceError.targetCredentialsInvalid
+        }
         // Refuse a destructive write when the current credential cannot be
         // read and restored. A denied backup write is not a successful backup.
         guard let token = keychain.readClaudeToken(), let identity = keychain.readOAuthAccount() else {
@@ -370,7 +374,8 @@ final class ClaudeService: @unchecked Sendable {
         }
         let previous = AccountBackup(token: token, oauthAccount: identity)
         if let currentAccount,
-           identity["emailAddress"]?.value as? String == currentAccount.email {
+           identity["emailAddress"]?.value as? String == currentAccount.email,
+           OAuthCredential(token)?.isCleared != true {
             guard keychain.saveAccountBackup(token: token, oauthAccount: identity,
                                              forAccountId: currentAccount.id.uuidString) else {
                 throw ClaudeServiceError.backupWriteFailed
@@ -583,6 +588,7 @@ enum ClaudeServiceError: LocalizedError {
     case keychainWriteFailed
     case oauthAccountWriteFailed
     case switchVerificationFailed
+    case targetCredentialsInvalid
     case switchWrongAccount(expected: String, actual: String)
 
     var errorDescription: String? {
@@ -605,6 +611,8 @@ enum ClaudeServiceError: LocalizedError {
             return "Failed to write oauthAccount to ~/.claude.json"
         case .switchVerificationFailed:
             return "Account switch verification failed"
+        case .targetCredentialsInvalid:
+            return "The destination login is not ready. Renew or re-authenticate that account before switching."
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
         }

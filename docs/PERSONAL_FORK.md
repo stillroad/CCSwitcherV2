@@ -1,6 +1,6 @@
 # Personal fork
 
-Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.5 (71).
+Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.6 (72).
 
 ## Why the CPU was high
 
@@ -48,6 +48,18 @@ When the active account's usage check is rate-limited and its last known, unexpi
 Polling cannot guarantee uninterrupted sessions: a burst can consume the last 1% between checks, the provider can throttle/delay usage readings, and running Claude clients decide when to reload credentials. Live account swaps are not exercised by the automated tests.
 
 ## Additional audit fixes
+
+### Login renewal and warnings (1.12.6)
+
+Every handoff checks the destination's saved login before replacing the live Claude credentials. An access token expiring within 15 minutes is renewed and saved first. The same preparation happens during the existing inactive-account usage checks, without switching into those accounts. Healthy credentials are reused. This adds no polling timer and keeps the active five-minute cadence and the configured inactive interval.
+
+Empty, incomplete, mismatched or rejected logins show a red **Login needs attention** notice and a **Sign in again** button in both Usage and Accounts. They are excluded from automatic rotation. Local checks run each normal cycle, including when CLI auth status fails, so a cleared inactive login need not wait hours for its next network usage check. Rejected refresh grants are remembered across restarts as hashes in preferences; raw credentials stay in Keychain. A new login clears the warning. An old quota reading cannot clear it.
+
+Near-expiry credentials show **Access token renewal due**. A network, server or Keychain failure shows an amber **Login check delayed** notice; it does not falsely demand browser login. Renewal failures use 5/10/20/30-minute backoff (or a longer server/user deadline), including manual repeated switch attempts. Active credentials are left to Claude's own renewal coordination; the app does not independently spend the live refresh token. It also refuses background renewal if the supposedly inactive saved grant matches the live one.
+
+The backup write boundary rejects cleared/incomplete credentials. A login-repair flow can proceed after Claude has cleared the source login without overwriting its existing backup. A destination is never selected if renewal fails or its new credentials cannot be durably saved. Existing two-store rollback protection is retained.
+
+Access-token expiry is measured from issuance or renewal, not from account selection, and is independent of the five-hour/weekly quota windows. A refresh grant can be revoked or rejected without a locally available expiry deadline. The app cannot promise that a browser login will never be needed, or that running Claude clients will reload credentials atomically. These changes cover the observed near-expiry handoff and cleared-backup failure paths; the exact server-side reason for the October 27 renewal rejection remains unknown.
 
 - Claude commands drain stdout and stderr independently while running, with an output cap and a deadline. Auth/status commands time out after 15 seconds; interactive login allows five minutes. A full pipe or hung CLI can no longer hold the refresh indefinitely. The network session uses a 15-second inactivity timeout and 20-second overall request timeout.
 - Routine usage checks no longer launch `claude --version`; they check the executable and use the existing auth-status call. Explicit version checking remains available in Settings.

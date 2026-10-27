@@ -8,15 +8,19 @@ private final class MemoryCredentials: AccountCredentialStore {
     var deleted: [String] = []
     var allowsDelete = true
     var allowsSave = true
+    var storeUnavailable = false
+    var saveDecisions: [Bool] = []
 
     func readClaudeToken() -> String? { liveToken }
     func readOAuthAccount() -> [String: AnyCodable]? { nil }
     func getAccountBackup(forAccountId id: String) -> AccountBackup? { backups[id] }
     func lookupAccountBackup(forAccountId id: String) -> KeychainService.BackupLookup {
-        backups[id].map { .found($0) } ?? .missing
+        if storeUnavailable { return .storeUnavailable }
+        return backups[id].map { .found($0) } ?? .missing
     }
     func saveAccountBackup(token: String, oauthAccount: [String: AnyCodable], forAccountId id: String) -> Bool {
         guard allowsSave else { return false }
+        if !saveDecisions.isEmpty, !saveDecisions.removeFirst() { return false }
         backups[id] = AccountBackup(token: token, oauthAccount: oauthAccount)
         return true
     }
@@ -43,11 +47,13 @@ private final class FakeClaude: ClaudeAccountClient {
     var onUsage: ((String) async throws -> UsageAPIResponse)?
     var onAuthStatus: (() async -> Void)?
     var onRotation: ((String) async -> ClaudeService.OAuthRefreshResult)?
+    var authError: Error?
 
     init(store: MemoryCredentials, email: String) { self.store = store; self.email = email }
     func isClaudeAvailable() async -> Bool { true }
     func getAuthStatus() async throws -> AuthStatus {
         await onAuthStatus?()
+        if let authError { throw authError }
         return AuthStatus(loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", email: email,
                    orgId: nil, orgName: nil, subscriptionType: "max")
     }
@@ -137,7 +143,14 @@ private final class Harness {
         localStats.work = nil
         defaults.removePersistentDomain(forName: suite)
     }
-    static func token(_ id: String) -> String { "{\"claudeAiOauth\":{\"accessToken\":\"\(id)\"}}" }
+    func expiringBackup(_ index: Int, at date: Date) {
+        let account = accounts[index]
+        store.backups[account.id.uuidString] = AccountBackup(token: Self.token("t\(index)", expiresAt: date),
+            oauthAccount: ["emailAddress": AnyCodable(account.email)])
+    }
+    static func token(_ id: String, expiresAt: Date = Date(timeIntervalSince1970: 2_000_000_000)) -> String {
+        "{\"claudeAiOauth\":{\"accessToken\":\"\(id)\",\"refreshToken\":\"r-\(id)\",\"expiresAt\":\(Int64(expiresAt.timeIntervalSince1970 * 1000))}}"
+    }
     static func usage(_ percent: Double, weekly: Double = 10, weeklyReset: TimeInterval = 3 * 86400) -> UsageAPIResponse {
         let date = ISO8601DateFormatter().string(from: Date().addingTimeInterval(weeklyReset))
         let sessionReset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600))
@@ -148,6 +161,219 @@ private final class Harness {
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    func testHandoffRenewsNearExpiryBeforeTouchingLiveLogin() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: Date().addingTimeInterval(9 * 60))
+        var renewals = 0
+        h.client.onRotation = { _ in
+            renewals += 1
+            XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+            XCTAssertTrue(h.client.switches.isEmpty)
+            return .success(Harness.token("renewed"))
+        }
+        h.client.usage["renewed"] = Harness.usage(10)
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(renewals, 1)
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        XCTAssertEqual(h.store.liveToken, Harness.token("renewed"))
+        XCTAssertEqual(h.store.backups[h.accounts[1].id.uuidString]?.token, Harness.token("renewed"))
+    }
+
+    func testHealthyHandoffDoesNotRenewUnnecessarily() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.client.onRotation = { _ in XCTFail("Healthy login should not renew"); return .rejected }
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+    }
+
+    func testRejectedHandoffLeavesLiveLoginAloneAndSurvivesRestart() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: Date().addingTimeInterval(9 * 60))
+        var renewals = 0
+        h.client.onRotation = { _ in renewals += 1; return .rejected }
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .needsReauthentication)
+        let restored = AppState(claudeService: h.client, keychain: h.store, defaults: h.defaults)
+        restored.accounts = h.accounts
+        restored.activeAccount = h.accounts[0]
+        await restored.switchTo(h.accounts[1])
+        XCTAssertEqual(renewals, 1)
+        XCTAssertEqual(restored.accountAuthHealth[h.accounts[1].id]?.kind, .needsReauthentication)
+
+        // A fresh browser login replaces the grant and clears the durable warning.
+        h.store.backups[h.accounts[1].id.uuidString] = AccountBackup(token: Harness.token("fresh-login"),
+            oauthAccount: ["emailAddress": AnyCodable(h.accounts[1].email)])
+        h.client.usage["fresh-login"] = Harness.usage(10)
+        await restored.switchTo(h.accounts[1])
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        XCTAssertEqual(restored.accountAuthHealth[h.accounts[1].id]?.kind, .ready)
+    }
+
+    func testEmptyInactiveLoginIsRedWithoutWaitingForItsUsageTurn() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.store.backups[h.accounts[2].id.uuidString] = AccountBackup(
+            token: "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0}}",
+            oauthAccount: ["emailAddress": AnyCodable(h.accounts[2].email)])
+        await h.state.refresh()
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[2].id]?.kind, .needsReauthentication)
+        XCTAssertEqual(h.client.usageCalls, ["t0", "t1"])
+    }
+
+    func testClearedActiveLoginIsRedEvenWhenAuthStatusThrows() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.store.liveToken = "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0}}"
+        h.client.authError = ClaudeServiceError.cliError("Exit 1")
+        await h.state.refresh()
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[0].id]?.kind, .needsReauthentication)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertEqual(h.store.backups[h.accounts[0].id.uuidString]?.token, Harness.token("t0"))
+    }
+
+    func testClearedSourceDoesNotBlockBrowserRepairOrOverwriteSavedBackup() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.store.liveToken = "{\"claudeAiOauth\":{\"accessToken\":null,\"refreshToken\":null,\"expiresAt\":0}}"
+        h.client.allowsCapture = false
+        await h.state.loginNewAccount()
+        XCTAssertEqual(h.client.loginCalls, 1)
+        // Only the post-login capture runs; the cleared source was skipped.
+        XCTAssertEqual(h.client.captureCalls, 1)
+        XCTAssertEqual(h.store.backups[h.accounts[0].id.uuidString]?.token, Harness.token("t0"))
+    }
+
+    func testRenewalRateLimitBlocksRepeatedClicksUntilServerDeadline() async {
+        let clock = TestClock()
+        let h = Harness(clock: clock)
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: clock.date.addingTimeInterval(60))
+        var renewals = 0
+        h.client.onRotation = { _ in renewals += 1; return .rateLimited(3600) }
+        await h.state.switchTo(h.accounts[1])
+        clock.advance(300)
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(renewals, 1)
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .temporarilyUnavailable)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+        clock.advance(3300)
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(renewals, 2)
+    }
+
+    func testRenewalCannotBeSelectedIfRotatedCredentialCannotBeSaved() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: Date().addingTimeInterval(60))
+        let original = h.store.backups[h.accounts[1].id.uuidString]?.token
+        h.store.saveDecisions = [true, false, false]
+        h.client.onRotation = { _ in .success(Harness.token("renewed")) }
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.backups[h.accounts[1].id.uuidString]?.token, original)
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .needsReauthentication)
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+    }
+
+    func testUnavailableStoreDoesNotTellUserToReauthenticate() async {
+        let h = Harness()
+        defer { h.cleanup() }
+        h.store.storeUnavailable = true
+        await h.state.switchTo(h.accounts[1])
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .temporarilyUnavailable)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertNil(h.defaults.dictionary(forKey: "com.ccswitcher.rejectedAuthGrants"))
+    }
+
+    func testFreshQuotaCannotBypassNearExpiryRenewalDuringAutoSwitch() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: Date().addingTimeInterval(9 * 60))
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0)
+        h.client.usage["t0"] = Harness.usage(95)
+        h.client.usage["t2"] = Harness.usage(95)
+        h.client.onUsage = { token in
+            if token == "t0" {
+                h.state.accountUsageSampledAt[h.accounts[1].id] = clock.date
+            }
+            return h.client.usage[token]!
+        }
+        h.client.onRotation = { _ in .rejected }
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertFalse(h.client.usageCalls.contains("t1"))
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .needsReauthentication)
+    }
+
+    func testAutoSwitchDisabledDuringPreflightRenewalLeavesLiveLoginAlone() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: clock.date.addingTimeInterval(60))
+        h.client.usage["t0"] = Harness.usage(95)
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0)
+        h.client.onUsage = { token in
+            if token == "t0" { h.state.accountUsageSampledAt[h.accounts[1].id] = clock.date }
+            return Harness.usage(95)
+        }
+        h.client.onRotation = { _ in
+            h.defaults.set(false, forKey: "autoSwitchEnabled")
+            return .success(Harness.token("renewed"))
+        }
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+        XCTAssertEqual(h.store.backups[h.accounts[1].id.uuidString]?.token, Harness.token("renewed"))
+    }
+
+    func testSlowRenewalCannotUseQuotaThatBecameStaleDuringPreflight() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.expiringBackup(1, at: clock.date.addingTimeInterval(60))
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0)
+        h.client.onUsage = { token in
+            if token == "t0" { h.state.accountUsageSampledAt[h.accounts[1].id] = clock.date }
+            return Harness.usage(95)
+        }
+        h.client.onRotation = { _ in
+            clock.advance(31)
+            return .success(Harness.token("renewed"))
+        }
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.liveToken, Harness.token("t0"))
+    }
+
+    func testRejectedFreshCandidateCanFallThroughToAnotherFreshCandidate() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.defaults.set("mostRemaining", forKey: "autoSwitchStrategy")
+        h.expiringBackup(1, at: clock.date.addingTimeInterval(60))
+        h.state.accountUsage[h.accounts[1].id] = Harness.usage(0, weekly: 0)
+        h.state.accountUsage[h.accounts[2].id] = Harness.usage(20, weekly: 20)
+        h.client.onUsage = { token in
+            if token == "t0" {
+                h.state.accountUsageSampledAt[h.accounts[1].id] = clock.date
+                h.state.accountUsageSampledAt[h.accounts[2].id] = clock.date
+                return Harness.usage(95)
+            }
+            return Harness.usage(20)
+        }
+        h.client.onRotation = { _ in .rejected }
+        await h.state.refresh()
+        XCTAssertEqual(h.client.switches, [h.accounts[2].id])
+        XCTAssertFalse(h.client.usageCalls.contains("t1"))
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[1].id]?.kind, .needsReauthentication)
+    }
     func testPauseAndResumePersistWithoutTouchingCredentialsOrPolling() throws {
         let h = Harness(autoSwitch: true)
         defer { h.cleanup() }

@@ -49,6 +49,11 @@ final class AppState: ObservableObject {
     }
     
     @Published var accountUsageErrors: [UUID: UsageErrorState] = [:]
+    @Published var accountAuthHealth: [UUID: AccountAuthHealth] = [:]
+    private let rejectedGrantsKey = "com.ccswitcher.rejectedAuthGrants"
+    private var authRetryNotBefore: [UUID: Date] = [:]
+    private var authRenewalFailures: [UUID: Int] = [:]
+    private var authRenewalAttempt: [UUID: Date] = [:]
 
     // MARK: - Services
 
@@ -193,7 +198,11 @@ final class AppState: ObservableObject {
             scheduleAutoRefresh()
         }
         errorMessage = nil
-        guard await refreshIdentity() else { return }
+        let identityOK = await refreshIdentity()
+        // Every normal cycle checks saved login structure locally, including
+        // accounts whose usage is not due for hours. No network calls here.
+        inspectSavedLogins()
+        guard identityOK else { updateWidgetData(); return }
         let started = now()
         lastCycleStart = started
         let targets = RefreshPolicy.usageTargets(
@@ -237,11 +246,14 @@ final class AppState: ObservableObject {
         lastIdentityAttempt = now()
         claudeAvailable = await claudeService.isClaudeAvailable()
         guard claudeAvailable else { return false }
+        let previousActive = activeAccount
         do {
             let status = try await claudeService.getAuthStatus()
+            if !status.loggedIn, let previousActive { inspectClearedLiveLogin(for: previousActive) }
             updateActiveAccount(from: status)
             identityVerified = status.loggedIn && status.email != nil && status.email == activeAccount?.email
         } catch {
+            if let previousActive { inspectClearedLiveLogin(for: previousActive) }
             errorMessage = error.localizedDescription
             return false
         }
@@ -432,6 +444,7 @@ final class AppState: ObservableObject {
             identityVerified = true
             lastAutoSwitchAt = now()
             accounts.append(account)
+            didCaptureLogin(account)
             saveAccounts()
             log.info("[addAccount] Account saved. Total accounts: \(self.accounts.count)")
         } catch {
@@ -465,9 +478,7 @@ final class AppState: ObservableObject {
             // 1. Back up current account (token + oauthAccount) before login overwrites them
             if let current = activeAccount {
                 log.info("[loginNewAccount] Step 1: Backing up current account (\(current.email))...")
-                guard claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString, expectedEmail: current.email) else {
-                    throw ClaudeServiceError.backupWriteFailed
-                }
+                try backUpBeforeLogin(current)
             } else {
                 log.info("[loginNewAccount] Step 1: No active account, skipping backup")
             }
@@ -514,6 +525,8 @@ final class AppState: ObservableObject {
                 lastAutoSwitchAt = now()
                 saveAccounts()
                 if captured {
+                    didCaptureLogin(accounts[existing])
+                    inspectSavedLogins()
                     errorMessage = String(localized: "Account already exists - credentials refreshed", bundle: L10n.bundle)
                 } else {
                     log.error("[loginNewAccount] Step 4: Backup capture FAILED for existing account")
@@ -548,6 +561,7 @@ final class AppState: ObservableObject {
             }
             accounts.append(account)
             activeAccount = account
+            didCaptureLogin(account)
             // A login is a deliberate account choice; grant it the same
             // auto-switch grace period a manual switch gets.
             lastAutoSwitchAt = now()
@@ -607,6 +621,11 @@ final class AppState: ObservableObject {
         accountUsage[account.id] = nil
         accountUsageSampledAt[account.id] = nil
         accountUsageErrors[account.id] = nil
+        accountAuthHealth[account.id] = nil
+        clearRejectedGrant(for: account)
+        authRetryNotBefore[account.id] = nil
+        authRenewalFailures[account.id] = nil
+        authRenewalAttempt[account.id] = nil
         usageRetryNotBefore[account.id] = nil
         consecutiveUsageRateLimits[account.id] = nil
         usageLastAttempt[account.id] = nil
@@ -625,7 +644,8 @@ final class AppState: ObservableObject {
     }
 
     @discardableResult
-    private func performSwitch(to requested: Account, refreshAfter: Bool = true) async -> Bool {
+    private func performSwitch(to requested: Account, refreshAfter: Bool = true,
+                               automaticPolicy: AutoSwitchEngine.Policy? = nil) async -> Bool {
         guard let account = accounts.first(where: { $0.id == requested.id }), activeAccount?.id != account.id else {
             log.info("[switchTo] No switch needed (same account or no active account)")
             return false
@@ -642,26 +662,32 @@ final class AppState: ObservableObject {
         }
         isSwitching = true
 
-        // Pre-switch: resolve the target's backup ONCE and hand it down.
-        // "The store is briefly unreadable" and "no backup exists" are
-        // different problems with different fixes — don't send the user to
-        // re-authenticate over a locked keychain. Passing the resolved backup
-        // into switchAccount also removes its second lookup, which collapsed
-        // exactly this distinction one layer down.
-        let targetBackup: AccountBackup
-        switch keychain.lookupAccountBackup(forAccountId: account.id.uuidString) {
-        case .found(let backup):
-            targetBackup = backup
-        case .missing:
-            log.error("[switchTo] ABORT: no backup for target account")
-            errorMessage = String(localized: "No stored credentials for \(account.email). Use re-authenticate to fix.", bundle: L10n.bundle)
+        // Validate/renew the destination before touching live credentials. A
+        // locked store is distinct from a missing/rejected login. Hand the
+        // prepared, durably saved credential to the switch transaction.
+        guard let targetBackup = await prepareBackup(for: account) else {
+            errorMessage = accountAuthHealth[account.id]?.message ?? "The destination login could not be checked. No switch was made."
             isSwitching = false
             return false
-        case .storeUnavailable:
-            log.error("[switchTo] ABORT: backup store unreadable right now")
-            errorMessage = String(localized: "Credential storage is temporarily unavailable. Try again shortly.", bundle: L10n.bundle)
-            isSwitching = false
-            return false
+        }
+        if let automaticPolicy {
+            guard autoSwitchEnabled, autoSwitchPolicy == automaticPolicy,
+                  activeAccount?.id == currentActive?.id,
+                  accounts.contains(where: { $0.id == account.id && !$0.isRotationPaused }),
+                  RefreshPolicy.isFreshSample(accountUsageSampledAt[account.id], cycleStart: lastCycleStart, asOf: now()),
+                  automaticPolicy.canSelect(accountUsage[account.id], asOf: now()) else {
+                isSwitching = false
+                return false
+            }
+            if let currentActive {
+                let fresh = RefreshPolicy.isFreshSample(accountUsageSampledAt[currentActive.id], cycleStart: lastCycleStart, asOf: now())
+                guard automaticPolicy.shouldSwitch(accountUsage[currentActive.id], asOf: now(), requireKnownWindow: !fresh)
+                    || (accountUsageErrors[currentActive.id]?.isRateLimited == true
+                        && automaticPolicy.shouldSwitchAfterRateLimit(accountUsage[currentActive.id], asOf: now())) else {
+                    isSwitching = false
+                    return false
+                }
+            }
         }
 
         // Any switch, deliberate or automatic, restarts the auto-switch cooldown:
@@ -711,7 +737,9 @@ final class AppState: ObservableObject {
     /// backup token and not be flagged expired (an expired backup would fail the
     /// switch verification, or silently swap in a dead session).
     private func isSwitchable(_ account: Account) -> Bool {
-        guard keychain.getAccountBackup(forAccountId: account.id.uuidString) != nil else { return false }
+        guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
+              inspectLogin(backup.token, for: account) else { return false }
+        guard (authRetryNotBefore[account.id] ?? .distantPast) <= now() else { return false }
         if let error = accountUsageErrors[account.id], error.isExpired { return false }
         return true
     }
@@ -821,8 +849,8 @@ final class AppState: ObservableObject {
             // switchTo() calls refresh() -> evaluateAutoSwitch() again, but the
             // re-entrancy flag + the freshly-set cooldown make that a no-op.
             // The active account visibly changes in the menu bar as feedback.
-            await performSwitch(to: target)
-            return
+            if await performSwitch(to: target, automaticPolicy: policy) { return }
+            failedAutoSwitchVerifications[target.id] = now()
         }
         log.info("[autoSwitch] Threshold reached but no candidate verified; staying put")
     }
@@ -832,51 +860,71 @@ final class AppState: ObservableObject {
     /// Returns nil when no reading could be taken. 429s are parked with the same
     /// scheme the polling loop uses, so verification can never leak around it.
     private func fetchUsageNow(for account: Account) async -> UsageAPIResponse? {
-        if let notBefore = usageRetryNotBefore[account.id], notBefore > now() {
-            log.info("[fetchUsageNow] \(account.id) is rate-limit parked; no fresh reading available")
-            return nil
-        }
+        guard (usageRetryNotBefore[account.id] ?? .distantPast) <= now() else { return nil }
         usageLastAttempt[account.id] = now()
-
-        let tokenJSON = (account.id == activeAccount?.id)
-            ? keychain.readClaudeToken()
-            : keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
-        guard let tokenJSON, let accessToken = ClaudeService.extractAccessToken(from: tokenJSON) else {
-            return nil
+        let renewalBefore = authRenewalAttempt[account.id]
+        let tokenJSON: String
+        if account.id == activeAccount?.id {
+            guard let live = keychain.readClaudeToken() else {
+                authUnavailable(account, "Could not read the active login. Check Keychain access.")
+                return nil
+            }
+            guard inspectLogin(live, for: account) else { return nil }
+            tokenJSON = live
+        } else {
+            guard let prepared = await prepareBackup(for: account) else { return nil }
+            tokenJSON = prepared.token
         }
+        guard let accessToken = ClaudeService.extractAccessToken(from: tokenJSON) else { return nil }
 
         do {
             await waitForUsageSpacing()
             return try await claudeService.getUsageLimits(accessToken: accessToken)
-        } catch ClaudeService.UsageError.expired where account.id != activeAccount?.id {
-            // Handle every refresh outcome, not just success: collapsing a dead
-            // grant (or a lost rotation) to a plain nil here would leave the
-            // account looking healthy — stale usage still shown, still eligible
-            // for auto-switch — until a later polling pass happened to notice.
-            switch await refreshBackupInPlace(for: account) {
-            case .refreshed(let refreshed):
-                guard let newToken = ClaudeService.extractAccessToken(from: refreshed) else { return nil }
-                return await usageRespectingParking(accessToken: newToken, account: account)
-            case .grantRejected, .noBackup, .rotationLost:
-                accountUsage[account.id] = nil
-                accountUsageSampledAt[account.id] = nil
-                accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Session expired. Re-authenticate (↻) to fix.", bundle: L10n.bundle))
-                return nil
-            case .storeUnavailable:
-                // Nothing spent, nothing lost; keep the stale sample and retry
-                // on a later cycle.
+        } catch ClaudeService.UsageError.expired {
+            if account.id == activeAccount?.id {
+                // Let Claude coordinate renewal of its shared live credential.
+                // Never POST the live refresh token independently of the CLI.
+                do {
+                    let status = try await claudeService.getAuthStatus()
+                    inspectClearedLiveLogin(for: account)
+                    updateActiveAccount(from: status)
+                    identityVerified = status.loggedIn && status.email == account.email
+                    guard identityVerified,
+                          let refreshed = keychain.readClaudeToken(), inspectLogin(refreshed, for: account),
+                          let token = ClaudeService.extractAccessToken(from: refreshed) else { return nil }
+                    // An unchanged expired credential cannot recover this read.
+                    guard token != accessToken else {
+                        authUnavailable(account, "The active login could not be renewed. Sign in again if Claude asks you to log in.")
+                        return nil
+                    }
+                    return await usageRespectingParking(accessToken: token, account: account)
+                } catch {
+                    inspectClearedLiveLogin(for: account)
+                    if accountAuthHealth[account.id]?.needsReauthentication != true {
+                        authUnavailable(account, "Could not check the active login. Will retry on the next usage check.")
+                    }
+                    return nil
+                }
+            }
+            // A fresh token that was already rejected gets no second renewal
+            // attempt in the same operation.
+            guard authRenewalAttempt[account.id] == renewalBefore else {
+                requireReauthentication(account, token: tokenJSON)
                 return nil
             }
+            guard let refreshed = await prepareBackup(for: account, forceRenewal: true),
+                  let token = ClaudeService.extractAccessToken(from: refreshed.token) else { return nil }
+            return await usageRespectingParking(accessToken: token, account: account)
         } catch ClaudeService.UsageError.rateLimited(let retryAfter) {
             park(account, retryAfter: retryAfter)
-            return nil
         } catch ClaudeService.UsageError.forbidden {
             clearForbiddenUsage(for: account)
-            return nil
         } catch {
+            accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: false,
+                message: "Could not fetch usage. Will retry on the next scheduled check.")
             log.warning("[fetchUsageNow] \(account.id): \(error.localizedDescription)")
-            return nil
         }
+        return nil
     }
 
     /// Re-authenticate an account by running `claude auth login` and capturing fresh credentials.
@@ -902,9 +950,7 @@ final class AppState: ObservableObject {
             // 1. Back up current active account before login overwrites it
             if let current = activeAccount, current.id != account.id {
                 log.info("[reauth] Backing up current account before login...")
-                guard claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString, expectedEmail: current.email) else {
-                    throw ClaudeServiceError.backupWriteFailed
-                }
+                try backUpBeforeLogin(current)
             }
 
             // 2. Run login
@@ -936,6 +982,7 @@ final class AppState: ObservableObject {
             // 4. Capture the fresh token
             let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email)
             log.info("[reauth] Token capture result: \(captured)")
+            if captured { didCaptureLogin(account) }
 
             // 5. Update account metadata. Done even when the capture failed —
             // the CLI really is on this account now — but a failed capture must
@@ -970,6 +1017,177 @@ final class AppState: ObservableObject {
             errorMessage = error.localizedDescription
             isLoggingIn = false
             log.error("[reauth] Error: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Login health
+
+    private func didCaptureLogin(_ account: Account) {
+        clearRejectedGrant(for: account)
+        authRetryNotBefore[account.id] = nil
+        authRenewalFailures[account.id] = nil
+        authRenewalAttempt[account.id] = nil
+        failedAutoSwitchVerifications[account.id] = nil
+        accountAuthHealth[account.id] = nil
+        if accountUsageErrors[account.id]?.isExpired == true { accountUsageErrors[account.id] = nil }
+    }
+
+    private func rejectedGrant(for account: Account) -> String? {
+        (defaults.dictionary(forKey: rejectedGrantsKey) as? [String: String])?[account.id.uuidString]
+    }
+
+    private func clearRejectedGrant(for account: Account) {
+        var rejected = defaults.dictionary(forKey: rejectedGrantsKey) as? [String: String] ?? [:]
+        if rejected.removeValue(forKey: account.id.uuidString) != nil {
+            defaults.set(rejected, forKey: rejectedGrantsKey)
+        }
+    }
+
+    private func requireReauthentication(_ account: Account, token: String?, message: String = "Sign in again. Automatic rotation skips this account.") {
+        if let token {
+            var rejected = defaults.dictionary(forKey: rejectedGrantsKey) as? [String: String] ?? [:]
+            let grant = OAuthCredential(token)?.grantID ?? OAuthCredential.digest(token)
+            if rejected[account.id.uuidString] != grant {
+                rejected[account.id.uuidString] = grant
+                defaults.set(rejected, forKey: rejectedGrantsKey)
+            }
+        }
+        accountAuthHealth[account.id] = AccountAuthHealth(kind: .needsReauthentication,
+            message: message, accessExpiresAt: nil)
+        accountUsage[account.id] = nil
+        accountUsageSampledAt[account.id] = nil
+        accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: message)
+    }
+
+    private func authUnavailable(_ account: Account, _ message: String) {
+        accountAuthHealth[account.id] = AccountAuthHealth(kind: .temporarilyUnavailable,
+            message: message, accessExpiresAt: nil)
+    }
+
+    /// A successful usage response does not prove that a rejected refresh grant
+    /// works. Keep that warning until a different login is actually captured.
+    @discardableResult
+    private func inspectLogin(_ token: String, for account: Account) -> Bool {
+        guard let credential = OAuthCredential(token), credential.isComplete else {
+            requireReauthentication(account, token: token)
+            return false
+        }
+        if let rejected = rejectedGrant(for: account) {
+            guard rejected != credential.grantID else {
+                requireReauthentication(account, token: token)
+                return false
+            }
+            clearRejectedGrant(for: account)
+            authRetryNotBefore[account.id] = nil
+            authRenewalFailures[account.id] = nil
+        }
+        if accountUsageErrors[account.id]?.isExpired == true { accountUsageErrors[account.id] = nil }
+        if (authRetryNotBefore[account.id] ?? .distantPast) <= now() {
+            let due = credential.needsRenewal(asOf: now())
+            accountAuthHealth[account.id] = AccountAuthHealth(kind: due ? .renewalDue : .ready,
+                message: account.id == activeAccount?.id
+                    ? "Claude renews the active login. If it asks you to sign in, use Sign in again."
+                    : "Will renew during its next usage check or before switching.",
+                accessExpiresAt: credential.expiresAt)
+        }
+        return true
+    }
+
+    /// Never confuse a denied Keychain read with an empty login. Only the
+    /// positively observed cleared shape proves that Claude discarded it.
+    private func inspectClearedLiveLogin(for account: Account, token: String? = nil) {
+        guard let live = token ?? keychain.readClaudeToken(), OAuthCredential(live)?.isCleared == true else { return }
+        let saved = keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
+        requireReauthentication(account, token: saved ?? live)
+    }
+
+    private func inspectSavedLogins() {
+        for account in accounts {
+            if account.id == activeAccount?.id {
+                guard let live = keychain.readClaudeToken() else {
+                    authUnavailable(account, "Could not read the active login. Check Keychain access.")
+                    continue
+                }
+                if OAuthCredential(live)?.isCleared == true {
+                    inspectClearedLiveLogin(for: account, token: live)
+                } else {
+                    _ = inspectLogin(live, for: account)
+                }
+                continue
+            }
+            switch keychain.lookupAccountBackup(forAccountId: account.id.uuidString) {
+            case .found(let backup):
+                if backup.oauthAccount["emailAddress"]?.value as? String == account.email {
+                    _ = inspectLogin(backup.token, for: account)
+                } else {
+                    requireReauthentication(account, token: backup.token, message: "Saved login does not match this account. Sign in again.")
+                }
+            case .missing: requireReauthentication(account, token: nil)
+            case .storeUnavailable: authUnavailable(account, "Login storage is unavailable. Unlock Keychain and try again.")
+            }
+        }
+    }
+
+    /// Runs under the same operation guard as usage checks, login and switching.
+    /// Renew only the selected/due inactive account, before touching live login.
+    private func prepareBackup(for account: Account, forceRenewal: Bool = false) async -> AccountBackup? {
+        let backup: AccountBackup
+        switch keychain.lookupAccountBackup(forAccountId: account.id.uuidString) {
+        case .found(let found): backup = found
+        case .missing:
+            requireReauthentication(account, token: nil)
+            return nil
+        case .storeUnavailable:
+            authUnavailable(account, "Login storage is unavailable. Unlock Keychain and try again.")
+            return nil
+        }
+        guard backup.oauthAccount["emailAddress"]?.value as? String == account.email else {
+            requireReauthentication(account, token: backup.token, message: "Saved login does not match this account. Sign in again.")
+            return nil
+        }
+        guard inspectLogin(backup.token, for: account), let credential = OAuthCredential(backup.token) else { return nil }
+        guard (authRetryNotBefore[account.id] ?? .distantPast) <= now() else { return nil }
+        if !forceRenewal && !credential.needsRenewal(asOf: now()) { return backup }
+
+        switch await refreshBackupInPlace(for: account) {
+        case .refreshed(let token):
+            _ = inspectLogin(token, for: account)
+            guard let refreshed = OAuthCredential(token), refreshed.isComplete,
+                  !refreshed.needsRenewal(asOf: now()) else {
+                deferAuthRenewal(account, message: "Renewal returned a short-lived login. This account was not selected.")
+                return nil
+            }
+            return AccountBackup(token: token, oauthAccount: backup.oauthAccount)
+        case .grantRejected, .rotationLost:
+            requireReauthentication(account, token: backup.token)
+        case .noBackup:
+            requireReauthentication(account, token: nil)
+        case .storeUnavailable:
+            if accountAuthHealth[account.id]?.kind != .temporarilyUnavailable {
+                deferAuthRenewal(account, message: "Login renewal is temporarily unavailable. Will retry later.")
+            }
+        }
+        return nil
+    }
+
+    private func deferAuthRenewal(_ account: Account, message: String, retryAfter: TimeInterval? = nil) {
+        let failures = min(4, (authRenewalFailures[account.id] ?? 0) + 1)
+        authRenewalFailures[account.id] = failures
+        let delay = RefreshPolicy.rateLimitDelay(consecutiveFailures: failures,
+            configured: configuredRefreshInterval, retryAfter: retryAfter)
+        authRetryNotBefore[account.id] = now().addingTimeInterval(delay)
+        authUnavailable(account, message)
+    }
+
+    /// Repairing a logged-out session must remain possible, but its cleared
+    /// token must never replace the last saved backup of the source account.
+    private func backUpBeforeLogin(_ account: Account) throws {
+        if let live = keychain.readClaudeToken(), OAuthCredential(live)?.isCleared == true {
+            inspectClearedLiveLogin(for: account, token: live)
+            return
+        }
+        guard claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email) else {
+            throw ClaudeServiceError.backupWriteFailed
         }
     }
 
@@ -1014,10 +1232,9 @@ final class AppState: ObservableObject {
             clearForbiddenUsage(for: account)
             return nil
         } catch ClaudeService.UsageError.expired {
-            accountUsage[account.id] = nil
-            accountUsageSampledAt[account.id] = nil
-            accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false,
-                message: "Session expired. Re-authenticate to fix.")
+            let token = account.id == activeAccount?.id ? keychain.readClaudeToken()
+                : keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
+            requireReauthentication(account, token: token)
             return nil
         } catch {
             log.warning("[fetchUsage] Post-refresh retry failed for \(account.id): \(error.localizedDescription)")
@@ -1046,8 +1263,8 @@ final class AppState: ObservableObject {
     }
 
     /// Refresh a non-active account's stored credential in place via the OAuth
-    /// token endpoint — no keychain swap, so no race with running Claude Code
-    /// sessions.
+    /// token endpoint without replacing the live credential. Existing Claude
+    /// processes may cache old tokens, so this is not a cross-process lock.
     private func refreshBackupInPlace(for account: Account) async -> BackupRefreshOutcome {
         let accountId = account.id.uuidString
 
@@ -1063,6 +1280,13 @@ final class AppState: ObservableObject {
             return .storeUnavailable
         }
 
+        guard account.id != activeAccount?.id,
+              let credential = OAuthCredential(backup.token), credential.isComplete else { return .grantRejected }
+        if let live = keychain.readClaudeToken(), OAuthCredential(live)?.grantID == credential.grantID {
+            deferAuthRenewal(account, message: "This saved login is also in use by Claude. Check the active account before switching.")
+            return .storeUnavailable
+        }
+
         // Prove the store is writable BEFORE spending the refresh token: the
         // endpoint can rotate it, and a rotation that cannot be persisted kills
         // the account (old token dead server-side, new one lost, manual re-login
@@ -1075,14 +1299,20 @@ final class AppState: ObservableObject {
             return .storeUnavailable
         }
 
+        authRenewalAttempt[account.id] = now()
         switch await claudeService.refreshOAuthCredentials(backup.token) {
         case .success(let refreshed):
+            guard OAuthCredential.canBackUp(refreshed) else { return .rotationLost }
             if keychain.saveAccountBackup(token: refreshed, oauthAccount: backup.oauthAccount, forAccountId: accountId) {
+                authRetryNotBefore[account.id] = nil
+                authRenewalFailures[account.id] = nil
                 return .refreshed(refreshed)
             }
             // The probe passed moments ago, so this is likely a blip — one retry.
             await pause(1)
             if keychain.saveAccountBackup(token: refreshed, oauthAccount: backup.oauthAccount, forAccountId: accountId) {
+                authRetryNotBefore[account.id] = nil
+                authRenewalFailures[account.id] = nil
                 return .refreshed(refreshed)
             }
             log.error("[refreshBackup] Rotation succeeded but the store write failed twice for \(account.id); the account needs re-authentication")
@@ -1094,6 +1324,10 @@ final class AppState: ObservableObject {
 
         case .transient:
             log.warning("[refreshBackup] Refresh attempt for \(account.id) failed transiently (network/server); will retry")
+            deferAuthRenewal(account, message: "Login renewal is temporarily unavailable. Will retry later.")
+            return .storeUnavailable
+        case .rateLimited(let retryAfter):
+            deferAuthRenewal(account, message: "Login renewal is rate-limited. Waiting before retrying.", retryAfter: retryAfter)
             return .storeUnavailable
         }
     }
@@ -1104,93 +1338,9 @@ final class AppState: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
         if account.id == activeAccount?.id { lastCycleStart = now() }
-        await waitForUsageSpacing()
-        usageLastAttempt[account.id] = now()
-        let tokenJSON: String?
-        if account.id == activeAccount?.id {
-            tokenJSON = keychain.readClaudeToken()
-        } else {
-            tokenJSON = keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
-        }
-        guard let tokenJSON, let accessToken = ClaudeService.extractAccessToken(from: tokenJSON) else {
-            log.warning("[fetchUsage] No token for \(account.email), skipping")
-            accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: false,
-                message: "Could not read saved credentials. Check keychain access.")
-            return
-        }
-        do {
-            // A rate limit parks this account immediately. Sleeping/retrying
-            // here would delay active-account monitoring behind idle accounts.
-            let usage = try await claudeService.getUsageLimits(accessToken: accessToken)
+        if let usage = await fetchUsageNow(for: account) {
             recordUsage(usage, for: account)
             log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
-        } catch ClaudeService.UsageError.forbidden {
-            // No active Pro/Max subscription on this account (e.g. the plan
-            // lapsed) - usage is meaningless until it recovers. Observed as:
-            // {"error":{"type":"permission_error","message":"OAuth
-            // authentication is currently not allowed for this organization."}}
-            log.warning("[fetchUsage] \(account.email) forbidden (no active subscription?)")
-            clearForbiddenUsage(for: account)
-        } catch ClaudeService.UsageError.rateLimited(let retryAfter) {
-            // Preserve the sample and its timestamp. The warning stays visible
-            // alongside it, and a known near-limit window can trigger failover.
-            park(account, retryAfter: retryAfter)
-        } catch ClaudeService.UsageError.expired {
-            log.warning("[fetchUsage] Token expired for \(account.email)")
-            if account.id == activeAccount?.id {
-                // Active account: delegated refresh via `claude auth status` is safe (no keychain swap)
-                do {
-                    let status = try await claudeService.getAuthStatus()
-                    updateActiveAccount(from: status)
-                    identityVerified = status.loggedIn && status.email == account.email
-                    guard identityVerified else { return }
-                    log.info("[fetchUsage] Delegated refresh completed for active account.")
-                    // Re-read refreshed token and retry
-                    if let refreshedJSON = keychain.readClaudeToken(),
-                       let refreshedToken = ClaudeService.extractAccessToken(from: refreshedJSON),
-                       let usage = await usageRespectingParking(accessToken: refreshedToken, account: account) {
-                        recordUsage(usage, for: account)
-                        log.info("[fetchUsage] Recovered \(account.email) via delegated refresh.")
-                    }
-                } catch {
-                    log.error("[fetchUsage] Delegated refresh failed for active account: \(error.localizedDescription)")
-                    accountUsage[account.id] = nil
-                    accountUsageSampledAt[account.id] = nil
-                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Token expired. Switch to refresh.", bundle: L10n.bundle))
-                }
-            } else {
-                // Non-active account: refresh the backup credential in place via
-                // the OAuth token endpoint - no keychain swap, so no race with
-                // running Claude Code sessions. Access tokens only live a few
-                // hours, so without this every non-active account would sit in
-                // a permanent "Token expired" state between switches.
-                switch await refreshBackupInPlace(for: account) {
-                case .refreshed(let refreshed):
-                    log.info("[fetchUsage] Silently refreshed backup for \(account.email); retrying usage")
-                    if let newToken = ClaudeService.extractAccessToken(from: refreshed),
-                       let usage = await usageRespectingParking(accessToken: newToken, account: account) {
-                        recordUsage(usage, for: account)
-                        log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
-                    }
-                case .grantRejected, .noBackup, .rotationLost:
-                    // Only re-authentication mints a new refresh token or a
-                    // new backup — an honest dead end until the user acts.
-                    // (.rotationLost is the loudest of the three; its log
-                    // line already says exactly what was lost and why.)
-                    accountUsage[account.id] = nil
-                    accountUsageSampledAt[account.id] = nil
-                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Session expired. Re-authenticate (↻) to fix.", bundle: L10n.bundle))
-                case .storeUnavailable:
-                    // Nothing was spent and nothing is lost; this heals by
-                    // itself on a later cycle. Keep the stale sample.
-                    accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: false, message: String(localized: "Could not save the refreshed sign-in; will retry automatically.", bundle: L10n.bundle))
-                }
-            }
-        } catch {
-            log.error("[fetchUsage] Failed to get usage for \(account.email): \(error.localizedDescription)")
-            accountUsage[account.id] = nil
-            accountUsageSampledAt[account.id] = nil
-            accountUsageErrors[account.id] = UsageErrorState(isExpired: false, isRateLimited: false, message: String(localized: "Could not fetch usage: \(error.localizedDescription)", bundle: L10n.bundle))
         }
     }
 
@@ -1212,7 +1362,8 @@ final class AppState: ObservableObject {
         return String(localized: "Claude CLI is authenticating via \(method) instead of a stored claude.ai login, so it reports no account. Unset ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE and remove any apiKeyHelper, then try again.", bundle: L10n.bundle)
     }
 
-    /// Passive health check — verifies backup existence and identity consistency.
+    /// Passive diagnostics. The per-cycle local inspection also publishes login
+    /// health; the presence of a JSON record alone never means a healthy login.
     private func diagnoseTokenHealth() {
         guard !accounts.isEmpty else { return }
 
@@ -1231,7 +1382,8 @@ final class AppState: ObservableObject {
         for account in accounts {
             if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
                 let backupEmail = (backup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
-                log.info("[diagnose] Backup [\(account.email)]: OK (email=\(backupEmail))")
+                let complete = OAuthCredential.canBackUp(backup.token)
+                log.info("[diagnose] Backup [\(account.email)]: complete=\(complete) (email=\(backupEmail))")
             } else {
                 log.warning("[diagnose] Backup [\(account.email)]: MISSING — switch will fail")
             }
@@ -1247,6 +1399,7 @@ final class AppState: ObservableObject {
         let widgetAccounts = accounts.map { account in
             let usage = accountUsage[account.id]
             let error = accountUsageErrors[account.id]
+            let auth = accountAuthHealth[account.id]
             return WidgetAccountData(
                 email: account.displayEmail(obfuscated: !defaults.bool(forKey: "showFullEmail")),
                 displayName: account.effectiveDisplayName(obfuscated: !defaults.bool(forKey: "showFullEmail")),
@@ -1257,8 +1410,8 @@ final class AppState: ObservableObject {
                 weeklyUtilization: usage?.sevenDay?.utilization,
                 weeklyResetTime: usage?.sevenDay?.resetTimeString,
                 extraUsageEnabled: usage?.extraUsage?.isEnabled,
-                hasError: error != nil,
-                errorMessage: error?.message
+                hasError: error != nil || auth?.needsReauthentication == true,
+                errorMessage: auth?.needsReauthentication == true ? auth?.message : error?.message
             )
         }
 

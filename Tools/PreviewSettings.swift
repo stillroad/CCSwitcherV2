@@ -18,11 +18,12 @@ enum PreviewSettings {
         let statisticsPreview = CommandLine.arguments.contains("--local-stats")
         let rateLimitPreview = CommandLine.arguments.contains("--rate-limit")
         let rotationPreview = CommandLine.arguments.contains("--rotation")
+        let authPreview = CommandLine.arguments.contains("--auth")
         let compactPreview = statisticsPreview || rateLimitPreview
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: rotationPreview ? 360 : (compactPreview ? 380 : 560), height: compactPreview ? 440 : 620),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: rotationPreview || authPreview ? 360 : (compactPreview ? 380 : 560), height: compactPreview ? 440 : 620),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "CCSwitcher Personal — Settings Preview"
-        if rotationPreview {
+        if rotationPreview || authPreview {
             let accounts = [
                 Account(email: "work@example.test", displayName: "Work", subscriptionType: "max", isActive: true),
                 Account(email: "reserved@example.test", displayName: "Reserved", subscriptionType: "max", isRotationPaused: true),
@@ -30,6 +31,12 @@ enum PreviewSettings {
             ]
             state.accounts = accounts
             state.activeAccount = accounts[0]
+            if authPreview {
+                state.accountAuthHealth[accounts[1].id] = AccountAuthHealth(kind: .needsReauthentication,
+                    message: "Sign in again. Automatic rotation skips this account.", accessExpiresAt: nil)
+                state.accountAuthHealth[accounts[2].id] = AccountAuthHealth(kind: .renewalDue,
+                    message: "Will renew during its next usage check or before switching.", accessExpiresAt: Date().addingTimeInterval(60))
+            }
             let reset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600))
             for account in accounts {
                 state.accountUsage[account.id] = UsageAPIResponse(
@@ -38,8 +45,14 @@ enum PreviewSettings {
                     sevenDayOauthApps: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
                     sevenDayCowork: nil, iguanaNecktie: nil, extraUsage: nil)
             }
-            window.contentView = NSHostingView(rootView: MainMenuView()
-                .environmentObject(state).environmentObject(updater).environmentObject(config))
+            if CommandLine.arguments.contains("--accounts") {
+                window.contentView = NSHostingView(rootView: AccountSwitcherView()
+                    .environmentObject(state)
+                    .preferredColorScheme(CommandLine.arguments.contains("--light") ? .light : .dark))
+            } else {
+                window.contentView = NSHostingView(rootView: MainMenuView()
+                    .environmentObject(state).environmentObject(updater).environmentObject(config))
+            }
         } else if rateLimitPreview {
             let account = Account(email: "preview@example.test", displayName: "Preview account", isActive: true)
             state.accounts = [account]

@@ -121,6 +121,12 @@ final class KeychainService: Sendable {
     // MARK: - Account Backup Operations (token + oauthAccount)
 
     func saveAccountBackup(token: String, oauthAccount: [String: AnyCodable], forAccountId accountId: String) -> Bool {
+        // A logged-out JSON document is readable but is not a backup. In
+        // particular, never replace a recoverable saved grant with that state.
+        guard OAuthCredential.canBackUp(token) else {
+            log.warning("[saveBackup] Refused empty or incomplete OAuth credentials for \(accountId)")
+            return false
+        }
         let email = (oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[saveBackup] Saving for \(accountId) (\(email)), token length=\(token.count)")
         storeLock.lock()

@@ -205,6 +205,7 @@ struct UsageDashboardView: View {
     private func accountUsageCard(account: Account, usage: UsageAPIResponse?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             accountHeader(account)
+            AccountAuthStatusView(account: account)
             if account.isRotationPaused {
                 Text("Rotation paused · Manual switching available")
                     .font(.caption)
@@ -215,10 +216,11 @@ struct UsageDashboardView: View {
                 extraUsageRow(usage.extraUsage)
                 sampleAgeLabel(account)
             }
-            if let errorState = appState.accountUsageErrors[account.id] {
+            if let errorState = appState.accountUsageErrors[account.id],
+               !(errorState.isExpired && appState.accountAuthHealth[account.id]?.needsReauthentication == true) {
                 HStack {
                     Image(systemName: errorState.isRateLimited ? "timer" : (errorState.isExpired ? "exclamationmark.triangle" : "xmark.circle"))
-                        .foregroundStyle(errorState.isExpired ? .yellow : .red)
+                        .foregroundStyle(.red)
                     Text(errorState.message)
                         .font(.caption)
                         .foregroundStyle(.textSecondary)
@@ -226,7 +228,7 @@ struct UsageDashboardView: View {
                     Spacer()
                 }
                 .padding(.top, 4)
-            } else if usage == nil {
+            } else if usage == nil && appState.accountAuthHealth[account.id] == nil {
                 // No sample yet (accounts are polled round-robin) - this is a
                 // waiting state, not an error. The old hardcoded "Token expired"
                 // text here made healthy accounts look broken.
