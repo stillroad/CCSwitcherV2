@@ -48,14 +48,24 @@ private final class FakeClaude: ClaudeAccountClient {
     var onAuthStatus: (() async -> Void)?
     var onRotation: ((String) async -> ClaudeService.OAuthRefreshResult)?
     var authError: Error?
+    var loggedIn = true
+    var authMethod: String? = "claude.ai"
+    var profileCalls = 0
+    var onProfile: ((String) async throws -> String)?
+    var beforeSwitch: (() -> Void)?
 
     init(store: MemoryCredentials, email: String) { self.store = store; self.email = email }
     func isClaudeAvailable() async -> Bool { true }
     func getAuthStatus() async throws -> AuthStatus {
         await onAuthStatus?()
         if let authError { throw authError }
-        return AuthStatus(loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", email: email,
+        return AuthStatus(loggedIn: loggedIn, authMethod: authMethod, apiProvider: "firstParty", email: authMethod == "claude.ai" ? email : nil,
                    orgId: nil, orgName: nil, subscriptionType: "max")
+    }
+    func getAccountEmail(accessToken: String) async throws -> String {
+        profileCalls += 1
+        if let onProfile { return try await onProfile(accessToken) }
+        throw ClaudeService.UsageError.network("Synthetic profile unavailable")
     }
     func getUsageLimits(accessToken: String) async throws -> UsageAPIResponse {
         events.append("usage:" + accessToken)
@@ -68,12 +78,18 @@ private final class FakeClaude: ClaudeAccountClient {
         return .rejected
     }
     func switchAccount(from currentAccount: Account?, to targetAccount: Account,
-                       targetBackup: AccountBackup) async throws -> ClaudeService.SwitchOutcome {
+                       targetBackup: AccountBackup, expectedCurrentToken: String?) async throws -> ClaudeService.SwitchOutcome {
+        beforeSwitch?()
+        if let expectedCurrentToken, store.liveToken != expectedCurrentToken {
+            throw CredentialSwitchTransaction.Failure.credentialsChanged
+        }
         if failsSwitch { throw ClaudeServiceError.switchVerificationFailed }
         events.append("switch:" + targetAccount.email)
         switches.append(targetAccount.id)
         store.liveToken = targetBackup.token
         email = targetAccount.email
+        loggedIn = true
+        authError = nil
         return ClaudeService.SwitchOutcome(shadowedBy: nil)
     }
     func captureCurrentCredentials(forAccountId accountId: String, expectedEmail: String) -> Bool { captureCalls += 1; return allowsCapture }
@@ -140,6 +156,7 @@ private final class Harness {
         client.onUsage = nil
         client.onAuthStatus = nil
         client.onRotation = nil
+        client.onProfile = nil
         localStats.work = nil
         defaults.removePersistentDomain(forName: suite)
     }
@@ -161,6 +178,219 @@ private final class Harness {
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    private static let rejectedLogin = "{\"claudeAiOauth\":{\"accessToken\":\"\",\"refreshToken\":\"\",\"expiresAt\":0}}"
+
+    private func rejectActiveLogin(_ h: Harness) {
+        CredentialAnchorStore(defaults: h.defaults).anchor(accountID: h.accounts[0].id, token: Harness.token("t0"))
+        h.store.liveToken = Self.rejectedLogin
+        h.client.loggedIn = false
+    }
+
+    func testRejectedActiveLoginRecoversWithFreshQuotaAndPreservesFailedBackup() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        rejectActiveLogin(h)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls, ["t1"])
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[1].id)
+        XCTAssertEqual(h.store.backups[h.accounts[0].id.uuidString]?.token, Harness.token("t0"))
+        XCTAssertEqual(h.state.accountAuthHealth[h.accounts[0].id]?.kind, .needsReauthentication)
+        XCTAssertTrue(h.client.events.first?.hasPrefix("usage:") == true)
+    }
+
+    func testRecoveryWorksWhenClaudeStatusThrowsOrAppRestartsLoggedOut() async {
+        for throwsStatus in [false, true] {
+            let h = Harness(autoSwitch: true)
+            rejectActiveLogin(h)
+            h.state.activeAccount = nil
+            if throwsStatus { h.client.authError = ClaudeServiceError.cliError("not logged in") }
+            await h.state.refresh()
+            XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+            h.cleanup()
+        }
+    }
+
+    func testRecoveryRespectsDisabledRotationAndPausedAccounts() async {
+        for enabled in [false, true] {
+            let h = Harness(autoSwitch: enabled)
+            rejectActiveLogin(h)
+            if enabled {
+                for account in h.accounts.dropFirst() { h.state.setAccountRotationPaused(account, paused: true) }
+            }
+            await h.state.refresh()
+            XCTAssertTrue(h.client.switches.isEmpty)
+            XCTAssertTrue(h.client.usageCalls.isEmpty)
+            h.cleanup()
+        }
+    }
+
+    func testRecoveryDoesNotTreatMissingMalformedOrOrdinaryLoggedOutCredentialsAsRejection() async {
+        for token in [nil, "broken", "{}", "{\"claudeAiOauth\":{}}"] as [String?] {
+            let h = Harness(autoSwitch: true)
+            rejectActiveLogin(h)
+            h.store.liveToken = token
+            h.client.loggedIn = false
+            await h.state.refresh()
+            XCTAssertTrue(h.client.switches.isEmpty)
+            h.cleanup()
+        }
+    }
+
+    func testRecoveryChecksOnlyOneCandidatePerFiveMinutesAndRejectsExhaustedQuota() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        rejectActiveLogin(h)
+        h.client.usage["t1"] = Harness.usage(0, weekly: 99)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls, ["t1"])
+        XCTAssertTrue(h.client.switches.isEmpty)
+        for _ in 0..<4 { clock.advance(60); await h.state.refresh() }
+        XCTAssertEqual(h.client.usageCalls, ["t1"])
+        clock.advance(60)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.usageCalls, ["t1", "t2"])
+        XCTAssertEqual(h.client.switches, [h.accounts[2].id])
+    }
+
+    func testRecoveryHonorsServerBackoff() async {
+        let clock = TestClock()
+        let h = Harness(count: 2, autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        rejectActiveLogin(h)
+        h.client.onUsage = { _ in throw ClaudeService.UsageError.rateLimited(retryAfter: 1800) }
+        await h.state.refresh()
+        for _ in 0..<5 { clock.advance(300); await h.state.refresh() }
+        XCTAssertEqual(h.client.usageCalls, ["t1"])
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testRecoveryNeverOverridesAnAPIKeyOrOtherCredentialSource() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        rejectActiveLogin(h)
+        h.client.loggedIn = true
+        h.client.authMethod = "api_key"
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertEqual(h.client.profileCalls, 0)
+    }
+
+    func testFailureDuringUsageStopsFullSweepAfterOneRecoveryCheck() async {
+        let h = Harness(count: 9, autoSwitch: true)
+        defer { h.cleanup() }
+        h.client.onUsage = { token in
+            if token == "t0" {
+                h.store.liveToken = Self.rejectedLogin
+                h.client.loggedIn = false
+                throw ClaudeService.UsageError.expired
+            }
+            return Harness.usage(10)
+        }
+        await h.state.refresh(allAccounts: true)
+        XCTAssertEqual(h.client.usageCalls, ["t0", "t1"])
+        XCTAssertEqual(h.client.switches, [h.accounts[1].id])
+    }
+
+    func testUpgradeRecognizesAlreadyRenewedLoginWithOneProfileCheck() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        h.store.liveToken = Harness.token("renewed-before-upgrade")
+        h.client.usage["renewed-before-upgrade"] = Harness.usage(20)
+        h.client.onProfile = { _ in h.accounts[0].email }
+        await h.state.refresh()
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+        XCTAssertEqual(h.client.profileCalls, 1)
+        await h.state.refresh()
+        XCTAssertEqual(h.client.profileCalls, 1)
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testProfileVerificationCannotAnchorAReplacedCredential() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        h.store.liveToken = Harness.token("unrecognized")
+        h.client.onProfile = { _ in
+            h.store.liveToken = Harness.token("different-login")
+            return h.accounts[0].email
+        }
+        await h.state.refresh()
+        XCTAssertNil(h.state.activeAccount)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.liveToken, Harness.token("different-login"))
+    }
+
+    func testUnrecognizedCredentialProfileCheckRespectsServerBackoff() async {
+        let clock = TestClock()
+        let h = Harness(autoSwitch: true, clock: clock)
+        defer { h.cleanup() }
+        h.store.liveToken = Harness.token("unrecognized")
+        h.client.onProfile = { _ in throw ClaudeService.UsageError.rateLimited(retryAfter: 1800) }
+        await h.state.refresh()
+        for _ in 0..<5 { clock.advance(300); await h.state.refresh() }
+        XCTAssertEqual(h.client.profileCalls, 1)
+        XCTAssertTrue(h.client.usageCalls.isEmpty)
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
+    func testRecoveryStandsDownWhenUserRepairsLoginOrChangesSettingsDuringVerification() async {
+        for action in ["repair", "disable", "pause", "threshold"] {
+            let h = Harness(autoSwitch: true)
+            rejectActiveLogin(h)
+            h.client.onUsage = { _ in
+                switch action {
+                case "repair": h.store.liveToken = Harness.token("user-repaired")
+                case "disable": h.defaults.set(false, forKey: "autoSwitchEnabled")
+                case "pause": h.state.setAccountRotationPaused(h.accounts[1], paused: true)
+                default: h.defaults.set(95.0, forKey: "autoSwitchWeeklyThreshold")
+                }
+                return Harness.usage(5)
+            }
+            await h.state.refresh()
+            XCTAssertTrue(h.client.switches.isEmpty, action)
+            if action == "repair" { XCTAssertEqual(h.store.liveToken, Harness.token("user-repaired")) }
+            h.cleanup()
+        }
+    }
+
+    func testRecoveryDoesNotOverwriteLoginRepairedJustBeforeSwitchWrite() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        rejectActiveLogin(h)
+        h.client.beforeSwitch = { h.store.liveToken = Harness.token("user-repaired") }
+        await h.state.refresh()
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.liveToken, Harness.token("user-repaired"))
+        h.client.beforeSwitch = nil
+    }
+
+    func testProfileDriftKeepsUsageOnActualCredentialOwner() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        await h.state.refresh()
+        h.client.email = h.accounts[1].email
+        await h.state.refresh()
+        XCTAssertEqual(h.state.activeAccount?.id, h.accounts[0].id)
+        XCTAssertTrue(h.client.switches.isEmpty)
+        XCTAssertEqual(h.store.backups[h.accounts[1].id.uuidString]?.token, Harness.token("t1"))
+    }
+
+    func testUnknownRotationAfterProfileDriftCannotBeFiledUnderAnotherAccount() async {
+        let h = Harness(autoSwitch: true)
+        defer { h.cleanup() }
+        await h.state.refresh()
+        h.client.email = h.accounts[1].email
+        await h.state.refresh()
+        h.store.liveToken = Harness.token("unknown-rotation")
+        await h.state.refresh()
+        XCTAssertNil(h.state.activeAccount)
+        XCTAssertFalse(h.client.usageCalls.contains("unknown-rotation"))
+        XCTAssertTrue(h.client.switches.isEmpty)
+    }
+
     func testHandoffRenewsNearExpiryBeforeTouchingLiveLogin() async {
         let h = Harness()
         defer { h.cleanup() }
@@ -530,7 +760,7 @@ final class AppStateTests: XCTestCase {
     func testLoginDoesNotOverwriteCredentialsWhenBackupFails() async {
         let h = Harness()
         defer { h.cleanup() }
-        h.client.allowsCapture = false
+        h.store.allowsSave = false
         await h.state.loginNewAccount()
         await h.state.reauthenticateAccount(h.accounts[1])
         XCTAssertEqual(h.client.loginCalls, 0)

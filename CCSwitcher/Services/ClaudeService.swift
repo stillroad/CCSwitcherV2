@@ -190,6 +190,29 @@ final class ClaudeService: @unchecked Sendable {
 
     // MARK: - Usage API
 
+    /// Used only when local credential ownership is ambiguous (for example the
+    /// first launch after upgrading with an already-renewed live login). It does
+    /// not renew tokens, change Keychain or run on every usage poll.
+    func getAccountEmail(accessToken: String) async throws -> String {
+        let url = URL(string: "https://api.anthropic.com/api/oauth/profile")!
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let (data, response) = try await Self.apiSession.data(for: request)
+        let http = response as? HTTPURLResponse
+        if http?.statusCode == 429 {
+            throw UsageError.rateLimited(retryAfter: RefreshPolicy.retryAfter(http?.value(forHTTPHeaderField: "Retry-After"), asOf: Date()))
+        }
+        guard http?.statusCode == 200 else { throw UsageError.network("Profile HTTP \(http?.statusCode ?? 0)") }
+        guard let profile = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = profile["account"] as? [String: Any],
+              let email = account["email"] as? String, !email.isEmpty else {
+            throw UsageError.decode("Profile did not identify an account")
+        }
+        return email
+    }
+
     enum UsageError: Error {
         case expired
         case network(String)
@@ -360,7 +383,8 @@ final class ClaudeService: @unchecked Sendable {
     /// missing backup from a briefly unreadable store) and handed down so no
     /// second, ambiguity-collapsing lookup happens here.
     @MainActor @discardableResult
-    func switchAccount(from currentAccount: Account?, to targetAccount: Account, targetBackup: AccountBackup) async throws -> SwitchOutcome {
+    func switchAccount(from currentAccount: Account?, to targetAccount: Account, targetBackup: AccountBackup,
+                       expectedCurrentToken: String? = nil) async throws -> SwitchOutcome {
         let keychain = KeychainService.shared
         guard let destination = OAuthCredential(targetBackup.token), destination.isComplete,
               !destination.needsRenewal(asOf: Date(), margin: 60),
@@ -372,20 +396,34 @@ final class ClaudeService: @unchecked Sendable {
         guard let token = keychain.readClaudeToken(), let identity = keychain.readOAuthAccount() else {
             throw ClaudeServiceError.currentCredentialsUnavailable
         }
+        if let expectedCurrentToken, token != expectedCurrentToken {
+            throw CredentialSwitchTransaction.Failure.credentialsChanged
+        }
         let previous = AccountBackup(token: token, oauthAccount: identity)
         if let currentAccount,
-           identity["emailAddress"]?.value as? String == currentAccount.email,
            OAuthCredential(token)?.isCleared != true {
-            guard keychain.saveAccountBackup(token: token, oauthAccount: identity,
+            // The cached profile may belong to an older window. Only a known
+            // credential owner can receive this backup; reuse its saved profile
+            // if the live profile has drifted.
+            guard CredentialAnchorStore().owns(accountID: currentAccount.id, token: token) else {
+                throw ClaudeServiceError.currentCredentialsUnavailable
+            }
+            let sourceIdentity = identity["emailAddress"]?.value as? String == currentAccount.email
+                ? identity : keychain.getAccountBackup(forAccountId: currentAccount.id.uuidString)?.oauthAccount
+            guard let sourceIdentity, sourceIdentity["emailAddress"]?.value as? String == currentAccount.email,
+                  keychain.saveAccountBackup(token: token, oauthAccount: sourceIdentity,
                                              forAccountId: currentAccount.id.uuidString) else {
                 throw ClaudeServiceError.backupWriteFailed
             }
         }
-        return try await CredentialSwitchTransaction.run(previous: previous, target: targetBackup,
+        let result = try await CredentialSwitchTransaction.run(previous: previous, target: targetBackup,
+                                                          readToken: keychain.readClaudeToken,
                                                           writeToken: keychain.writeClaudeToken,
                                                           writeIdentity: keychain.writeOAuthAccount) {
             try await self.verifySwitch(to: targetAccount, backup: targetBackup)
         }
+        CredentialAnchorStore().anchor(accountID: targetAccount.id, token: targetBackup.token)
+        return result
     }
 
     @MainActor
@@ -393,6 +431,12 @@ final class ClaudeService: @unchecked Sendable {
         // 4. Verify
         log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
         let status = try await getAuthStatus()
+        // A matching profile name alone cannot prove a successful handoff.
+        guard let live = KeychainService.shared.readClaudeToken(),
+              OAuthCredential(live)?.accessToken == OAuthCredential(targetBackup.token)?.accessToken,
+              OAuthCredential(live)?.grantID == OAuthCredential(targetBackup.token)?.grantID else {
+            throw CredentialSwitchTransaction.Failure.credentialsChanged
+        }
         guard status.loggedIn else {
             log.error("[switchAccount] Step 4: Not logged in after switch!")
             throw ClaudeServiceError.switchVerificationFailed
@@ -400,8 +444,8 @@ final class ClaudeService: @unchecked Sendable {
 
         if let email = status.email {
             guard email == targetAccount.email else {
-                log.error("[switchAccount] Step 4: Logged in as \(email) instead of \(targetAccount.email)")
-                throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: email)
+                log.warning("[switchAccount] Cached profile disagrees with the verified destination credential; retaining credential ownership")
+                return SwitchOutcome(shadowedBy: status.shadowingAuthMethod)
             }
             log.info("[switchAccount] Step 4: Switch verified — logged in as \(email)")
             return SwitchOutcome(shadowedBy: nil)
@@ -453,6 +497,10 @@ final class ClaudeService: @unchecked Sendable {
             log.error("[capture] Failed: no token found in keychain")
             return false
         }
+        if let owner = CredentialAnchorStore().owner(of: token), owner.uuidString != accountId {
+            log.warning("[capture] Known live credential belongs to another account; refusing to misfile it")
+            return false
+        }
         guard let oauthAccount = keychain.readOAuthAccount() else {
             log.error("[capture] Failed: no oauthAccount found in ~/.claude.json")
             return false
@@ -464,6 +512,9 @@ final class ClaudeService: @unchecked Sendable {
         let email = expectedEmail
         log.info("[capture] Token + oauthAccount found (email=\(email)), saving backup...")
         let result = keychain.saveAccountBackup(token: token, oauthAccount: oauthAccount, forAccountId: accountId)
+        if result, let id = UUID(uuidString: accountId) {
+            CredentialAnchorStore().anchor(accountID: id, token: token)
+        }
         log.info("[capture] Save result: \(result)")
         return result
     }

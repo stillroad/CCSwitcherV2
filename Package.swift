@@ -65,6 +65,7 @@ let package = Package(
                 "CCSwitcher/Services/RefreshPolicy.swift",
                 "CCSwitcher/Services/BoundedProcess.swift",
                 "CCSwitcher/Services/CredentialSwitchTransaction.swift",
+                "CCSwitcher/Services/CredentialAnchor.swift",
                 "CCSwitcher/Services/OAuthCredential.swift",
                 "CCSwitcher/Services/ActivityParser.swift",
                 "CCSwitcher/Services/ClaudeService.swift",

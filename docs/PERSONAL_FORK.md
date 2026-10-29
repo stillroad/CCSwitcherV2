@@ -1,6 +1,6 @@
 # Personal fork
 
-Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.6 (72).
+Based on upstream commit `80618d6` (version 1.12.0). The original account storage identifiers and formats are retained. The personal build is version 1.12.7 (73).
 
 ## Why the CPU was high
 
@@ -57,9 +57,17 @@ Empty, incomplete, mismatched or rejected logins show a red **Login needs attent
 
 Near-expiry credentials show **Access token renewal due**. A network, server or Keychain failure shows an amber **Login check delayed** notice; it does not falsely demand browser login. Renewal failures use 5/10/20/30-minute backoff (or a longer server/user deadline), including manual repeated switch attempts. Active credentials are left to Claude's own renewal coordination; the app does not independently spend the live refresh token. It also refuses background renewal if the supposedly inactive saved grant matches the live one.
 
-The backup write boundary rejects cleared/incomplete credentials. A login-repair flow can proceed after Claude has cleared the source login without overwriting its existing backup. A destination is never selected if renewal fails or its new credentials cannot be durably saved. Existing two-store rollback protection is retained.
+The backup write boundary rejects cleared/incomplete credentials. A login-repair flow can proceed after Claude has cleared the source login without overwriting its existing backup. A destination is never selected if renewal fails or its new credentials cannot be durably saved. A failed transaction checks the live credential before rollback: a newer login or renewal from another window is preserved rather than replaced with the old source.
 
-Access-token expiry is measured from issuance or renewal, not from account selection, and is independent of the five-hour/weekly quota windows. A refresh grant can be revoked or rejected without a locally available expiry deadline. The app cannot promise that a browser login will never be needed, or that running Claude clients will reload credentials atomically. These changes cover the observed near-expiry handoff and cleared-backup failure paths; the exact server-side reason for the October 27 renewal rejection remains unknown.
+### Recovery after a rejected active login (1.12.7)
+
+When auto-switch is enabled and Claude has written its explicit rejected-refresh-token marker, CCSwitcher can recover onto another account on the next normal refresh. This path bypasses the requirement for a currently logged-in identity, using the last confirmed credential owner instead. It preserves the failed account's backup and red sign-in warning. It checks at most one replacement per configured interval, validates fresh session and weekly usage, and respects account pauses, selection strategy, threshold changes and server backoff. If no replacement qualifies, it keeps the warning and waits. It does not treat a missing Keychain item, denied read, malformed data, ordinary logout or another authentication method as permission to sign in automatically.
+
+Recovery rechecks the failed credential after asynchronous work and again at the write boundary. A browser login or external repair that happens meanwhile cancels recovery. The app does not add an independent live-token renewal loop or accelerate usage polling. At a five-minute interval, detection can take up to the next check, plus request time. Existing windows may need their interrupted request retried; continuous, interruption-free execution cannot be guaranteed.
+
+Credential hashes now anchor the live login to its known owner. An older window rewriting the cached profile name cannot move another account's token into that account's backup or misattribute its usage. An unfamiliar rotated credential after a profile mismatch, or an already-renewed login at first launch after upgrading, is confirmed with a read-only profile request. This exceptional check is rate-limited and respects Retry-After; known credentials need no extra profile request during routine polling. No raw credentials are written to preferences or diagnostic logs.
+
+Access-token expiry is measured from issuance or renewal, not from account selection, and is independent of the five-hour/weekly quota windows. A refresh grant can be revoked or rejected without a locally available expiry deadline. The app cannot promise that a browser login will never be needed, or that running Claude clients will reload credentials atomically. These changes cover near-expiry handoff, cleared-backup corruption, credential/profile drift and recovery after active-login rejection. The exact server-side reasons for the October 27 and October 28 renewal rejections remain unknown.
 
 - Claude commands drain stdout and stderr independently while running, with an output cap and a deadline. Auth/status commands time out after 15 seconds; interactive login allows five minutes. A full pipe or hung CLI can no longer hold the refresh indefinitely. The network session uses a 15-second inactivity timeout and 20-second overall request timeout.
 - Routine usage checks no longer launch `claude --version`; they check the executable and use the existing auth-status call. Explicit version checking remains available in Settings.
@@ -108,7 +116,9 @@ The personal-build flag prevents Sparkle from being initialized even if the exis
 
 ## Validation
 
-The 2026-10-26 regression suite passed **93 automated tests**. The Release app and widget compiled for both architectures, and the packaged app passed strict signature verification. Pause/resume controls were exercised in both tabs in the native preview at the real 360-point menu width. Live OAuth swaps, Intel execution and registration on a second Mac were not exercised by the test suite.
+The 2026-10-28 regression suite passed **130 automated tests**, including rejected-login recovery, no extra candidate polling, server backoff, paused/exhausted candidates, external repair during recovery, profile drift, recognition of an already-renewed login on upgrade, and preservation of another window's newer credentials during rollback. Live OAuth swaps, Intel execution and registration on a second Mac are not exercised by the test suite. The earlier pause/resume controls were exercised in both tabs in the native preview at the real 360-point menu width.
+
+The 1.12.7 Release application and widget built for arm64 and x86_64. The packaged application passed strict nested signature verification; the ZIP contains only the application bundle and its packaging metadata.
 
 `swift test` covers reset ordering, both threshold modes, exact 48-hour/99% boundaries, invalid and stale readings, provider isolation, cooldown exceptions, nine-account scheduling, server backoff, reset-triggered refreshes, fixed active polling, daily statistics scheduling and snapshot persistence. It also exercises the actual AppState orchestration with injected in-memory services: concurrent credential operations, a nine-account slow sweep, failed removal, changed external identity, backup write failure, stale candidate verification and long backoff. Subprocess tests use harmless local commands to cover pipe saturation, timeout, output limits and exit codes. Credential transaction tests inject write and verification failures. No test reads real credentials or contacts Claude. Test preference suites and files are isolated and cleaned up.
 

@@ -9,6 +9,10 @@ struct OAuthCredential {
     let accessToken: String?
     let refreshToken: String?
     let expiresAt: Date?
+    /// Claude's invalid_grant handler writes this exact tombstone. A missing
+    /// item, unreadable Keychain, malformed JSON or ordinary logout is not proof
+    /// of rejected renewal and must not trigger automatic login recovery.
+    let isRejectedLogin: Bool
 
     init?(_ json: String) {
         guard let root = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
@@ -19,6 +23,9 @@ struct OAuthCredential {
         }
         accessToken = nonempty(oauth["accessToken"])
         refreshToken = nonempty(oauth["refreshToken"])
+        isRejectedLogin = (oauth["accessToken"] as? String) == ""
+            && (oauth["refreshToken"] as? String) == ""
+            && (oauth["expiresAt"] as? Double) == 0
         if let milliseconds = oauth["expiresAt"] as? Double,
            milliseconds.isFinite, milliseconds > 0 {
             expiresAt = Date(timeIntervalSince1970: milliseconds / 1000)

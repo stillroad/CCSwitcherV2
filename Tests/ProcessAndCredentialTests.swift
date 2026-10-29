@@ -43,7 +43,7 @@ final class ProcessAndCredentialTests: XCTestCase {
             var identity = old.oauthAccount
             var verified = false
             do {
-                try await CredentialSwitchTransaction.run(previous: old, target: new, writeToken: {
+                try await CredentialSwitchTransaction.run(previous: old, target: new, readToken: { token }, writeToken: {
                     token = $0
                     return !(failingStage == "token" && $0 == new.token)
                 }, writeIdentity: {
@@ -67,8 +67,9 @@ final class ProcessAndCredentialTests: XCTestCase {
         let old = AccountBackup(token: "old", oauthAccount: [:])
         let new = AccountBackup(token: "new", oauthAccount: ["id": AnyCodable(2)])
         var writes: [String] = []
-        let result = try await CredentialSwitchTransaction.run(previous: old, target: new, writeToken: {
-            writes.append($0); return true
+        var token = old.token
+        let result = try await CredentialSwitchTransaction.run(previous: old, target: new, readToken: { token }, writeToken: {
+            token = $0; writes.append($0); return true
         }, writeIdentity: { _ in true }, verify: { "verified" })
         XCTAssertEqual(result, "verified")
         XCTAssertEqual(writes, ["new"])
@@ -80,11 +81,44 @@ final class ProcessAndCredentialTests: XCTestCase {
         let new = AccountBackup(token: "new", oauthAccount: ["id": AnyCodable(2)])
         var restoredIdentity = false
         do {
-            try await CredentialSwitchTransaction.run(previous: old, target: new, writeToken: { _ in false },
+            try await CredentialSwitchTransaction.run(previous: old, target: new, readToken: { old.token }, writeToken: { _ in false },
                 writeIdentity: { identity in restoredIdentity = identity == old.oauthAccount; return true }, verify: {})
             XCTFail("Expected rollback failure")
         } catch CredentialSwitchTransaction.Failure.rollbackFailed {
             XCTAssertTrue(restoredIdentity)
         }
+    }
+
+    @MainActor
+    func testRollbackCannotEraseAnotherWindowsNewLogin() async throws {
+        let old = AccountBackup(token: "cleared-old-login", oauthAccount: ["id": AnyCodable(1)])
+        let target = AccountBackup(token: "target", oauthAccount: ["id": AnyCodable(2)])
+        var token = old.token
+        var identity = old.oauthAccount
+        do {
+            try await CredentialSwitchTransaction.run(previous: old, target: target,
+                readToken: { token }, writeToken: { token = $0; return true },
+                writeIdentity: { identity = $0; return true }, verify: {
+                    token = "new-browser-login"
+                    identity = ["id": AnyCodable(3)]
+                    throw ClaudeServiceError.switchVerificationFailed
+                })
+            XCTFail("Expected concurrent change")
+        } catch CredentialSwitchTransaction.Failure.credentialsChanged {
+            XCTAssertEqual(token, "new-browser-login")
+            XCTAssertEqual(identity, ["id": AnyCodable(3)])
+        }
+    }
+
+    @MainActor
+    func testChangedSourceStopsBeforeWritingEitherStore() async throws {
+        let old = AccountBackup(token: "old", oauthAccount: [:])
+        let target = AccountBackup(token: "target", oauthAccount: [:])
+        do {
+            try await CredentialSwitchTransaction.run(previous: old, target: target,
+                readToken: { "newer-login" }, writeToken: { _ in XCTFail("Must not write"); return true },
+                writeIdentity: { _ in XCTFail("Must not write"); return true }, verify: {})
+            XCTFail("Expected concurrent change")
+        } catch CredentialSwitchTransaction.Failure.credentialsChanged {}
     }
 }

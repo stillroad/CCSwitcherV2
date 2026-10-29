@@ -63,6 +63,16 @@ final class AppState: ObservableObject {
     private var persistLocalStats: (LocalStatsSnapshot) -> Void = { $0.save() }
     private var readsSupplementalLocalStats = true
     private lazy var keychain: any AccountCredentialStore = KeychainService.shared
+    private lazy var credentialAnchor = CredentialAnchorStore(defaults: defaults)
+
+    private struct LoginRecovery: Equatable {
+        let accountID: UUID
+        let clearedToken: String
+    }
+    private var pendingLoginRecovery: LoginRecovery?
+    private var lastLoginRecoveryAttempt: Date?
+    private var storedLoginIsShadowed = false
+    private var ownershipRetryNotBefore: Date = .distantPast
 
     private var defaults: UserDefaults = .standard
     private var now: () -> Date = Date.init
@@ -131,6 +141,79 @@ final class AppState: ObservableObject {
     @Published private(set) var isSwitching = false
 
     // MARK: - Auto-switch
+
+    private func recoveryStillApplies(_ recovery: LoginRecovery) -> Bool {
+        pendingLoginRecovery == recovery
+            && !storedLoginIsShadowed
+            && credentialAnchor.lastKnownAccountID == recovery.accountID
+            && (activeAccount == nil || activeAccount?.id == recovery.accountID)
+            && keychain.readClaudeToken() == recovery.clearedToken
+            && OAuthCredential(recovery.clearedToken)?.isRejectedLogin == true
+    }
+
+    /// Only a positively observed rejected-login tombstone permits this path.
+    /// Unknown identity, a locked Keychain or a failed usage request never does.
+    /// One replacement check per configured interval; all existing backoffs and
+    /// pause/threshold settings still apply. No independent live OAuth renewal.
+    private func recoverRejectedLogin() async {
+        guard autoSwitchEnabled, claudeAvailable, !isRefreshing, !isSwitching, !isLoggingIn, !isEvaluatingAutoSwitch,
+              let recovery = pendingLoginRecovery else { return }
+        guard recoveryStillApplies(recovery) else {
+            pendingLoginRecovery = nil
+            return
+        }
+        guard let failed = accounts.first(where: { $0.id == recovery.accountID }),
+              RefreshPolicy.isDue(lastAttempt: lastLoginRecoveryAttempt,
+                                  interval: configuredRefreshInterval, asOf: now()) else { return }
+
+        isEvaluatingAutoSwitch = true
+        defer { isEvaluatingAutoSwitch = false }
+        lastLoginRecoveryAttempt = now()
+        let policy = autoSwitchPolicy
+        let candidates = accounts.filter {
+            $0.id != failed.id && $0.provider == failed.provider && !$0.isRotationPaused
+                && (usageRetryNotBefore[$0.id] ?? .distantPast) <= now()
+                && (failedAutoSwitchVerifications[$0.id] ?? .distantPast)
+                    .addingTimeInterval(2 * configuredRefreshInterval) <= now()
+                && isSwitchable($0)
+        }.sorted { lhs, rhs in
+            let l = accountUsage[lhs.id], r = accountUsage[rhs.id]
+            let lReady = policy.canSelect(l, asOf: now()), rReady = policy.canSelect(r, asOf: now())
+            if lReady != rReady { return lReady }
+            if policy.strategy == .soonestReset {
+                let lr = l?.sevenDay?.resetsAtDate.flatMap { $0 > now() ? $0 : nil } ?? .distantFuture
+                let rr = r?.sevenDay?.resetsAtDate.flatMap { $0 > now() ? $0 : nil } ?? .distantFuture
+                if lr != rr { return lr < rr }
+            }
+            let lu = AutoSwitchEngine.bindingUtilization(l, asOf: now()) ?? .infinity
+            let ru = AutoSwitchEngine.bindingUtilization(r, asOf: now()) ?? .infinity
+            return lu == ru ? lhs.id.uuidString < rhs.id.uuidString : lu < ru
+        }
+        guard let target = candidates.first else {
+            errorMessage = "The active login expired. No available account could be used for recovery. Sign in again on the affected account."
+            return
+        }
+
+        log.info("[authRecovery] Checking one replacement for rejected login \(failed.id)")
+        lastSwitchVerificationAttempt[failed.id] = now()
+        guard let usage = await fetchUsageNow(for: target) else {
+            failedAutoSwitchVerifications[target.id] = now()
+            return
+        }
+        recordUsage(usage, for: target)
+        guard policy.canSelect(usage, asOf: now()) else {
+            failedAutoSwitchVerifications[target.id] = now()
+            return
+        }
+        guard autoSwitchEnabled, autoSwitchPolicy == policy, recoveryStillApplies(recovery),
+              accounts.contains(where: { $0.id == target.id && !$0.isRotationPaused }) else { return }
+        if await performSwitch(to: target, refreshAfter: false, automaticPolicy: policy, recovering: recovery) {
+            errorMessage = nil
+            log.info("[authRecovery] Restored a usable login via \(target.id); rejected account remains excluded")
+        } else {
+            failedAutoSwitchVerifications[target.id] = now()
+        }
+    }
 
     /// Whether proactive auto-switch is on (written by SettingsView via @AppStorage).
     private var autoSwitchEnabled: Bool {
@@ -202,6 +285,14 @@ final class AppState: ObservableObject {
         // Every normal cycle checks saved login structure locally, including
         // accounts whose usage is not due for hours. No network calls here.
         inspectSavedLogins()
+        if pendingLoginRecovery != nil {
+            // Recovery shares the normal timer. Do not turn a rejected login
+            // into an all-account refresh or a fast retry loop.
+            lastCycleStart = now()
+            await recoverRejectedLogin()
+            updateWidgetData()
+            return
+        }
         guard identityOK else { updateWidgetData(); return }
         let started = now()
         lastCycleStart = started
@@ -217,6 +308,11 @@ final class AppState: ObservableObject {
             // ahead of the next active check or delay an urgent switch.
             if target.id != activeAccount?.id, activePollIsDue(), let active = activeAccount {
                 await fetchAccountUsage(active)
+                if pendingLoginRecovery != nil {
+                    await recoverRejectedLogin()
+                    updateWidgetData()
+                    return
+                }
                 await evaluateAutoSwitch()
             }
             guard let account = accounts.first(where: { $0.id == target.id }) else { continue }
@@ -224,6 +320,11 @@ final class AppState: ObservableObject {
             // as its refresh, including when it just became the active account.
             if (usageLastAttempt[account.id] ?? .distantPast) >= started { continue }
             await fetchAccountUsage(account)
+            if pendingLoginRecovery != nil {
+                await recoverRejectedLogin()
+                updateWidgetData()
+                return
+            }
             await evaluateAutoSwitch()
         }
         lastUsageRefresh = now()
@@ -246,12 +347,21 @@ final class AppState: ObservableObject {
         lastIdentityAttempt = now()
         claudeAvailable = await claudeService.isClaudeAvailable()
         guard claudeAvailable else { return false }
-        let previousActive = activeAccount
+        let previousActive = activeAccount ?? accounts.first { $0.id == credentialAnchor.lastKnownAccountID }
         do {
             let status = try await claudeService.getAuthStatus()
+            storedLoginIsShadowed = status.loggedIn && !status.reportsClaudeAiIdentity
             if !status.loggedIn, let previousActive { inspectClearedLiveLogin(for: previousActive) }
             updateActiveAccount(from: status)
-            identityVerified = status.loggedIn && status.email != nil && status.email == activeAccount?.email
+            if status.loggedIn, status.reportsClaudeAiIdentity, activeAccount == nil || status.email == nil {
+                await verifyUnanchoredLogin()
+            }
+            identityVerified = status.loggedIn && status.reportsClaudeAiIdentity && activeAccount != nil
+            if status.loggedIn {
+                // An external login or a higher-priority API credential takes
+                // precedence over recovery of the old saved login.
+                pendingLoginRecovery = nil
+            }
         } catch {
             if let previousActive { inspectClearedLiveLogin(for: previousActive) }
             errorMessage = error.localizedDescription
@@ -261,7 +371,7 @@ final class AppState: ObservableObject {
             diagnoseTokenHealth()
             lastDiagnosticsAt = now()
         }
-        return true
+        return identityVerified
     }
 
     private func activePollIsDue() -> Bool {
@@ -616,6 +726,8 @@ final class AppState: ObservableObject {
             return
         }
         accounts.removeAll { $0.id == account.id }
+        credentialAnchor.forget(accountID: account.id)
+        if pendingLoginRecovery?.accountID == account.id { pendingLoginRecovery = nil }
         // Drop every per-account cache too, or a re-added account inherits the
         // removed one's readings, error banner and rate-limit park.
         accountUsage[account.id] = nil
@@ -645,7 +757,8 @@ final class AppState: ObservableObject {
 
     @discardableResult
     private func performSwitch(to requested: Account, refreshAfter: Bool = true,
-                               automaticPolicy: AutoSwitchEngine.Policy? = nil) async -> Bool {
+                               automaticPolicy: AutoSwitchEngine.Policy? = nil,
+                               recovering recovery: LoginRecovery? = nil) async -> Bool {
         guard let account = accounts.first(where: { $0.id == requested.id }), activeAccount?.id != account.id else {
             log.info("[switchTo] No switch needed (same account or no active account)")
             return false
@@ -661,6 +774,16 @@ final class AppState: ObservableObject {
             return false
         }
         isSwitching = true
+
+        // Bootstrap ownership for a manual switch made before the first timer
+        // refresh. A profile name alone is never enough to overwrite a backup.
+        if recovery == nil, let live = keychain.readClaudeToken(), let currentActive,
+           OAuthCredential(live)?.isComplete == true,
+           resolveCredentialOwner(token: live, claimed: currentActive.id) != currentActive.id {
+            errorMessage = "The current login's account could not be confirmed. Refresh its identity before switching."
+            isSwitching = false
+            return false
+        }
 
         // Validate/renew the destination before touching live credentials. A
         // locked store is distinct from a missing/rejected login. Hand the
@@ -679,7 +802,12 @@ final class AppState: ObservableObject {
                 isSwitching = false
                 return false
             }
-            if let currentActive {
+            if let recovery {
+                guard recoveryStillApplies(recovery) else {
+                    isSwitching = false
+                    return false
+                }
+            } else if let currentActive {
                 let fresh = RefreshPolicy.isFreshSample(accountUsageSampledAt[currentActive.id], cycleStart: lastCycleStart, asOf: now())
                 guard automaticPolicy.shouldSwitch(accountUsage[currentActive.id], asOf: now(), requireKnownWindow: !fresh)
                     || (accountUsageErrors[currentActive.id]?.isRateLimited == true
@@ -698,7 +826,8 @@ final class AppState: ObservableObject {
         isLoading = true
         let outcome: ClaudeService.SwitchOutcome
         do {
-            outcome = try await claudeService.switchAccount(from: currentActive, to: account, targetBackup: targetBackup)
+            outcome = try await claudeService.switchAccount(from: currentActive, to: account, targetBackup: targetBackup,
+                                                            expectedCurrentToken: recovery?.clearedToken)
 
             for i in accounts.indices {
                 accounts[i].isActive = (accounts[i].id == account.id)
@@ -707,11 +836,14 @@ final class AppState: ObservableObject {
                 }
             }
             activeAccount = accounts.first(where: { $0.id == account.id })
+            credentialAnchor.anchor(accountID: account.id, token: targetBackup.token)
+            pendingLoginRecovery = nil
             identityVerified = outcome.shadowedBy == nil
             saveAccounts()
         } catch {
             identityVerified = false
             if case CredentialSwitchTransaction.Failure.rollbackFailed = error { clearActiveAccount() }
+            if case CredentialSwitchTransaction.Failure.credentialsChanged = error { clearActiveAccount() }
             errorMessage = error.localizedDescription
             isLoading = false
             isSwitching = false
@@ -756,6 +888,10 @@ final class AppState: ObservableObject {
     /// (rare, threshold-gated, cooldown-gated) switch attempt, not the per-cycle
     /// burst the round-robin exists to prevent.
     private func evaluateAutoSwitch() async {
+        if pendingLoginRecovery != nil {
+            await recoverRejectedLogin()
+            return
+        }
         guard autoSwitchEnabled, identityVerified, !isRefreshing, !isEvaluatingAutoSwitch else { return }
         guard !isLoggingIn, !isSwitching, let active = activeAccount else { return }
 
@@ -886,9 +1022,11 @@ final class AppState: ObservableObject {
                 // Never POST the live refresh token independently of the CLI.
                 do {
                     let status = try await claudeService.getAuthStatus()
+                    storedLoginIsShadowed = status.loggedIn && !status.reportsClaudeAiIdentity
+                    if storedLoginIsShadowed { pendingLoginRecovery = nil }
                     inspectClearedLiveLogin(for: account)
                     updateActiveAccount(from: status)
-                    identityVerified = status.loggedIn && status.email == account.email
+                    identityVerified = status.loggedIn && status.reportsClaudeAiIdentity && activeAccount?.id == account.id
                     guard identityVerified,
                           let refreshed = keychain.readClaudeToken(), inspectLogin(refreshed, for: account),
                           let token = ClaudeService.extractAccessToken(from: refreshed) else { return nil }
@@ -1023,6 +1161,8 @@ final class AppState: ObservableObject {
     // MARK: - Login health
 
     private func didCaptureLogin(_ account: Account) {
+        if let live = keychain.readClaudeToken() { credentialAnchor.anchor(accountID: account.id, token: live) }
+        pendingLoginRecovery = nil
         clearRejectedGrant(for: account)
         authRetryNotBefore[account.id] = nil
         authRenewalFailures[account.id] = nil
@@ -1099,6 +1239,11 @@ final class AppState: ObservableObject {
         guard let live = token ?? keychain.readClaudeToken(), OAuthCredential(live)?.isCleared == true else { return }
         let saved = keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
         requireReauthentication(account, token: saved ?? live)
+        if !storedLoginIsShadowed, OAuthCredential(live)?.isRejectedLogin == true,
+           credentialAnchor.lastKnownAccountID == account.id {
+            pendingLoginRecovery = LoginRecovery(accountID: account.id, clearedToken: live)
+            identityVerified = false
+        }
     }
 
     private func inspectSavedLogins() {
@@ -1186,7 +1331,12 @@ final class AppState: ObservableObject {
             inspectClearedLiveLogin(for: account, token: live)
             return
         }
-        guard claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email) else {
+        guard let live = keychain.readClaudeToken(),
+              resolveCredentialOwner(token: live, claimed: account.id) == account.id,
+              let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
+              backup.oauthAccount["emailAddress"]?.value as? String == account.email,
+              keychain.saveAccountBackup(token: live, oauthAccount: backup.oauthAccount,
+                                         forAccountId: account.id.uuidString) else {
             throw ClaudeServiceError.backupWriteFailed
         }
     }
@@ -1466,11 +1616,15 @@ final class AppState: ObservableObject {
             if !status.loggedIn { clearActiveAccount() }
             return
         }
-        if let index = accounts.firstIndex(where: { $0.email == email }) {
+        let claimed = accounts.first(where: { $0.email == email })?.id
+        let owner = keychain.readClaudeToken().flatMap { resolveCredentialOwner(token: $0, claimed: claimed) }
+        if let owner, let index = accounts.firstIndex(where: { $0.id == owner }) {
             var updated = accounts
             for i in updated.indices { updated[i].isActive = i == index }
-            updated[index].orgName = status.orgName
-            updated[index].subscriptionType = status.subscriptionType
+            if owner == claimed {
+                updated[index].orgName = status.orgName
+                updated[index].subscriptionType = status.subscriptionType
+            }
             if accounts != updated {
                 accounts = updated
                 saveAccounts()
@@ -1483,12 +1637,52 @@ final class AppState: ObservableObject {
             guard claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email) else { return }
             accounts.append(account)
             activeAccount = account
+            didCaptureLogin(account)
             shouldAutoCaptureAccount = false
             saveAccounts()
         } else {
             // An external login must never attach the new token's usage to a
             // previously active saved account or trigger a switch from it.
             clearActiveAccount()
+        }
+    }
+
+    private func resolveCredentialOwner(token: String, claimed: UUID?) -> UUID? {
+        credentialAnchor.resolve(token: token, claimedID: claimed) {
+            guard let live = OAuthCredential(token), live.isComplete else { return nil }
+            let matches = accounts.filter { account in
+                guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
+                      backup.oauthAccount["emailAddress"]?.value as? String == account.email,
+                      let saved = OAuthCredential(backup.token), saved.isComplete else { return false }
+                return saved.accessToken == live.accessToken || saved.grantID == live.grantID
+            }
+            // Duplicate credentials cannot establish which account owns them.
+            return matches.count == 1 ? matches[0].id : nil
+        }
+    }
+
+    private func verifyUnanchoredLogin() async {
+        guard now() >= ownershipRetryNotBefore,
+              let live = keychain.readClaudeToken(), let credential = OAuthCredential(live),
+              credential.isComplete, let access = credential.accessToken else { return }
+        ownershipRetryNotBefore = now().addingTimeInterval(configuredRefreshInterval)
+        do {
+            let email = try await claudeService.getAccountEmail(accessToken: access)
+            guard let current = keychain.readClaudeToken(),
+                  OAuthCredential(current)?.accessToken == access,
+                  OAuthCredential(current)?.grantID == credential.grantID,
+                  let account = accounts.first(where: { $0.email == email }) else { return }
+            credentialAnchor.anchor(accountID: account.id, token: current)
+            updateActiveAccount(from: AuthStatus(loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty",
+                email: account.email, orgId: nil, orgName: account.orgName, subscriptionType: account.subscriptionType))
+            log.info("[identity] Confirmed previously unrecognized live credential for \(account.id)")
+        } catch ClaudeService.UsageError.rateLimited(let retryAfter) {
+            ownershipRetryNotBefore = now().addingTimeInterval(RefreshPolicy.rateLimitDelay(
+                consecutiveFailures: 1, configured: configuredRefreshInterval, retryAfter: retryAfter))
+            errorMessage = "Account identity checks are temporarily rate-limited. Waiting before retrying."
+        } catch {
+            errorMessage = "Could not confirm which account owns the current login. Automatic switching will wait for the next scheduled check."
+            log.warning("[identity] Live credential ownership could not be confirmed; retaining saved backups")
         }
     }
 

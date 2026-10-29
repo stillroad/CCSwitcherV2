@@ -24,6 +24,7 @@ Personal fork of [XueshiQiao/CCSwitcher](https://github.com/XueshiQiao/CCSwitche
 - Separate switching sliders default to **90% for 5-hour sessions** and **99% for weekly usage**. Auto-switch can prefer the soonest **weekly reset**; the optional final-48-hour override affects only the weekly threshold.
 - If a usage check is rate-limited within two points of either threshold, auto-switch can leave early for a freshly verified alternative. Cached readings retain their timestamp and show the monitoring warning.
 - Local cost/activity statistics run **only when requested** by default; daily calculation is optional. Scans are cancellable and stop after a one-minute budget, independently of usage checks and switching.
+- With auto-switch enabled, a confirmed rejected active login triggers recovery to a freshly checked, unpaused account on the normal refresh schedule. Credential ownership is tracked separately from Claude's cached profile name.
 - Upstream automatic updates are disabled in the personal build.
 
 Run `swift test` for the policy and account-coordination tests with synthetic credentials and `scripts/build-personal.sh` for a universal, locally signed app and ZIP (Apple Silicon + Intel).

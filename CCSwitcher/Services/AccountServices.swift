@@ -6,10 +6,11 @@ import Foundation
 protocol ClaudeAccountClient {
     func isClaudeAvailable() async -> Bool
     func getAuthStatus() async throws -> AuthStatus
+    func getAccountEmail(accessToken: String) async throws -> String
     func getUsageLimits(accessToken: String) async throws -> UsageAPIResponse
     func refreshOAuthCredentials(_ credentialsJSON: String) async -> ClaudeService.OAuthRefreshResult
     func switchAccount(from currentAccount: Account?, to targetAccount: Account,
-                       targetBackup: AccountBackup) async throws -> ClaudeService.SwitchOutcome
+                       targetBackup: AccountBackup, expectedCurrentToken: String?) async throws -> ClaudeService.SwitchOutcome
     func captureCurrentCredentials(forAccountId accountId: String, expectedEmail: String) -> Bool
     func login() async throws
 }
